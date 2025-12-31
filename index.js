@@ -9,7 +9,7 @@ const COOKIE = process.env.ROBLOSECURITY;
 const WEBHOOK = process.env.DISCORD_WEBHOOK;
 const OPENAI_KEY = process.env.OPENAI_API_KEY;
 
-const INTERVALO = 5000;      // 5s teste
+const INTERVALO = 5000;      // 5s (teste)
 const JANELA_MS = 10000;    // 10s
 const LIMITE_RAPIDO = 3;    // suspeito
 /* ========================================= */
@@ -25,9 +25,7 @@ let ultimoTexto = "";
 
 /* ================= SCREENSHOT (FIREFOX) ================= */
 async function capturarAudit() {
-  const browser = await firefox.launch({
-    headless: true
-  });
+  const browser = await firefox.launch({ headless: true });
 
   const context = await browser.newContext();
 
@@ -149,5 +147,5 @@ async function monitorar() {
 }
 /* =========================================== */
 
-console.log("🛡️ Auditoria visual Roblox ATIVA (Firefox)");
+console.log("🛡️ Auditoria visual Roblox ATIVA (Firefox / Playwright 1.57)");
 setInterval(monitorar, INTERVALO);
