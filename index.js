@@ -5,17 +5,19 @@ const GROUP_ID = process.env.GROUP_ID;
 const COOKIE = process.env.ROBLOSECURITY;
 const WEBHOOK = process.env.DISCORD_WEBHOOK;
 
-// Usuário que será exilado quando o sistema detectar abuso
 const TARGET_USER_ID = process.env.TARGET_USER_ID;
 const TARGET_USER_NAME = process.env.TARGET_USER_NAME;
 
-// Critérios
-const LIMITE = 1;        // 4 ações
-const JANELA_MS = 2000;  // em até 2 segundos
-const INTERVALO = 1500;  // intervalo de checagem
+// Critérios (TESTE)
+const LIMITE = 1;        // 1 ação (teste)
+const JANELA_MS = 2000;  // 2 segundos
+const INTERVALO = 1500;
 // =========================================
 
-// Cliente Roblox COM HEADERS (OBRIGATÓRIO)
+// CSRF
+let csrfToken = null;
+
+// Cliente Roblox
 const roblox = axios.create({
   headers: {
     Cookie: `.ROBLOSECURITY=${COOKIE}`,
@@ -23,32 +25,45 @@ const roblox = axios.create({
     "User-Agent": "Roblox/WinInet",
     "X-Requested-With": "XMLHttpRequest",
     "Referer": "https://www.roblox.com/"
-  }
+  },
+  validateStatus: () => true // IMPORTANTE
 });
-
-// Estado
-let historicoAceite = [];
-let historicoRecusa = [];
-let ultimoPendentes = null;
 
 // ================= FUNÇÕES =================
 
-// Ver quantos pedidos pendentes existem
+// Atualiza CSRF token automaticamente
+async function refreshCSRF() {
+  const res = await roblox.post("https://auth.roblox.com/v2/logout");
+  csrfToken = res.headers["x-csrf-token"];
+  roblox.defaults.headers["X-CSRF-TOKEN"] = csrfToken;
+}
+
+// GET pendentes
 async function getPendentes() {
-  const { data } = await roblox.get(
+  const res = await roblox.get(
     `https://groups.roblox.com/v1/groups/${GROUP_ID}/join-requests?limit=10`
   );
-  return data.data.length;
+  return res.data.data.length;
 }
 
-// Exilar usuário do grupo
+// EXILAR (COM CSRF)
 async function exilarUsuario(userId) {
-  await roblox.delete(
+  if (!csrfToken) await refreshCSRF();
+
+  const res = await roblox.delete(
     `https://groups.roblox.com/v1/groups/${GROUP_ID}/users/${userId}`
   );
+
+  // Se token expirou, tenta de novo
+  if (res.status === 403) {
+    await refreshCSRF();
+    await roblox.delete(
+      `https://groups.roblox.com/v1/groups/${GROUP_ID}/users/${userId}`
+    );
+  }
 }
 
-// Enviar relatório no Discord (COM >)
+// Discord
 async function enviarRelatorio(motivo) {
   const agora = new Date().toLocaleString("pt-BR");
 
@@ -68,75 +83,37 @@ async function enviarRelatorio(motivo) {
 }
 
 // ================= DETECÇÃO =================
+let historicoAceite = [];
+let ultimoPendentes = null;
+
 async function monitorar() {
   try {
     const pendentes = await getPendentes();
     const agora = Date.now();
 
-    if (ultimoPendentes !== null) {
-      // ACEITES (pendentes diminuíram)
-      if (pendentes < ultimoPendentes) {
-        historicoAceite.push(agora);
-      }
+    if (ultimoPendentes !== null && pendentes < ultimoPendentes) {
+      historicoAceite.push(agora);
+    }
 
-      // RECUSAS (pendentes aumentaram)
-      if (pendentes > ultimoPendentes) {
-        historicoRecusa.push(agora);
-      }
+    historicoAceite = historicoAceite.filter(
+      t => agora - t <= JANELA_MS
+    );
 
-      // Limpa histórico fora da janela
-      historicoAceite = historicoAceite.filter(
-        t => agora - t <= JANELA_MS
-      );
-      historicoRecusa = historicoRecusa.filter(
-        t => agora - t <= JANELA_MS
-      );
-
-      // Detecta ACEITAÇÃO em massa
-      if (historicoAceite.length >= LIMITE) {
-        await exilarUsuario(TARGET_USER_ID);
-        await enviarRelatorio(
-          "Aceitação em massa suspeita (Accept All)"
-        );
-        historicoAceite = [];
-      }
-
-      // Detecta RECUSA em massa
-      if (historicoRecusa.length >= LIMITE) {
-        await exilarUsuario(TARGET_USER_ID);
-        await enviarRelatorio(
-          "Recusa em massa suspeita (Decline All)"
-        );
-        historicoRecusa = [];
-      }
+    if (historicoAceite.length >= LIMITE) {
+      await exilarUsuario(TARGET_USER_ID);
+      await enviarRelatorio("Aceitação em massa suspeita (Accept All)");
+      historicoAceite = [];
     }
 
     ultimoPendentes = pendentes;
-  } catch (err) {
-    console.error(
-      "Erro:",
-      err.response?.status || err.message
-    );
-  }
-}
-
-// ================= TESTE DE AUTH (RODA 1 VEZ) =================
-async function testeAuth() {
-  try {
-    const { data } = await roblox.get(
-      "https://users.roblox.com/v1/users/authenticated"
-    );
-    console.log("✅ Logado como:", data.name);
   } catch (e) {
-    console.error(
-      "❌ AUTH FALHOU:",
-      e.response?.status
-    );
+    console.error("Erro:", e.response?.status || e.message);
   }
 }
 
-testeAuth();
-
-// ================= LOOP =================
-console.log("🛡️ Anti Accept/Decline All ATIVO");
-setInterval(monitorar, INTERVALO);
+// ================= START =================
+(async () => {
+  await refreshCSRF();
+  console.log("🛡️ Anti Accept-All ativo com CSRF");
+  setInterval(monitorar, INTERVALO);
+})();
