@@ -1,9 +1,7 @@
-import { chromium } from "playwright";
+import { firefox } from "playwright";
 import OpenAI from "openai";
 import axios from "axios";
 import fs from "fs";
-import path from "path";
-import os from "os";
 
 /* ================= CONFIG ================= */
 const GROUP_ID = process.env.GROUP_ID;
@@ -25,26 +23,13 @@ const openai = new OpenAI({ apiKey: OPENAI_KEY });
 const historico = new Map();
 let ultimoTexto = "";
 
-/* ================= SCREENSHOT ================= */
+/* ================= SCREENSHOT (FIREFOX) ================= */
 async function capturarAudit() {
-  const userDataDir = path.join(os.tmpdir(), "pw-user-data");
-
-  const context = await chromium.launchPersistentContext(userDataDir, {
-    headless: true,
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-gpu",
-      "--disable-software-rasterizer",
-      "--disable-extensions",
-      "--disable-background-networking",
-      "--disable-sync",
-      "--disable-translate",
-      "--disable-features=VizDisplayCompositor",
-      "--mute-audio"
-    ]
+  const browser = await firefox.launch({
+    headless: true
   });
+
+  const context = await browser.newContext();
 
   await context.addCookies([{
     name: ".ROBLOSECURITY",
@@ -66,9 +51,10 @@ async function capturarAudit() {
   await page.waitForTimeout(3000);
 
   await page.screenshot({ path: "audit.png" });
-  await context.close();
+
+  await browser.close();
 }
-/* ============================================= */
+/* ======================================================== */
 
 /* ================= OPENAI OCR ================= */
 async function analisarImagem() {
@@ -163,5 +149,5 @@ async function monitorar() {
 }
 /* =========================================== */
 
-console.log("🛡️ Auditoria visual Roblox ATIVA (modo teste)");
+console.log("🛡️ Auditoria visual Roblox ATIVA (Firefox)");
 setInterval(monitorar, INTERVALO);
