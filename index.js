@@ -5,48 +5,31 @@ const GROUP_ID = process.env.GROUP_ID;
 const COOKIE = process.env.ROBLOSECURITY;
 const WEBHOOK = process.env.DISCORD_WEBHOOK;
 
-const TARGET_USER_ID = process.env.TARGET_USER_ID;
-const TARGET_USER_NAME = process.env.TARGET_USER_NAME;
+const LIMITE = 2;            // Ações máximas permitidas na janela
+const JANELA_MS = 2000;    // Janela de tempo (10 segundos)
+const INTERVALO = 5000;      // A cada 5 segundos
+// ==========================================
 
-// Critérios (TESTE)
-const LIMITE = 1;        // 1 ação (teste)
-const JANELA_MS = 2000;  // 2 segundos
-const INTERVALO = 1500;
-// =========================================
-
-// CSRF
 let csrfToken = null;
+const logsRecentes = new Map(); // Armazena logs por usuário
 
-// Cliente Roblox
 const roblox = axios.create({
   headers: {
     Cookie: `.ROBLOSECURITY=${COOKIE}`,
     "Content-Type": "application/json",
-    "User-Agent": "Roblox/WinInet",
-    "X-Requested-With": "XMLHttpRequest",
-    "Referer": "https://www.roblox.com/"
+    "User-Agent": "RobloxBot/1.0"
   },
-  validateStatus: () => true // IMPORTANTE
+  validateStatus: () => true
 });
 
-// ================= FUNÇÕES =================
-
-// Atualiza CSRF token automaticamente
+// Atualiza CSRF
 async function refreshCSRF() {
   const res = await roblox.post("https://auth.roblox.com/v2/logout");
   csrfToken = res.headers["x-csrf-token"];
   roblox.defaults.headers["X-CSRF-TOKEN"] = csrfToken;
 }
 
-// GET pendentes
-async function getPendentes() {
-  const res = await roblox.get(
-    `https://groups.roblox.com/v1/groups/${GROUP_ID}/join-requests?limit=10`
-  );
-  return res.data.data.length;
-}
-
-// EXILAR (COM CSRF)
+// Exilar usuário
 async function exilarUsuario(userId) {
   if (!csrfToken) await refreshCSRF();
 
@@ -54,7 +37,6 @@ async function exilarUsuario(userId) {
     `https://groups.roblox.com/v1/groups/${GROUP_ID}/users/${userId}`
   );
 
-  // Se token expirou, tenta de novo
   if (res.status === 403) {
     await refreshCSRF();
     await roblox.delete(
@@ -63,57 +45,86 @@ async function exilarUsuario(userId) {
   }
 }
 
-// Discord
-async function enviarRelatorio(motivo) {
+// Relatório Discord
+async function enviarRelatorio(username, motivo) {
   const agora = new Date().toLocaleString("pt-BR");
-
   const mensagem = `**> 『 RELATÓRIO DE DEMISSÃO 』
 > =================================
-> ➩ Responsável: <@1455692969322614895>
-> ➩ Permissão concedida: <@1331505963622076476>
-> =================================
-> ➩ Militar rebaixado: ${TARGET_USER_NAME}
+> ➩ Usuário expulso: ${username}
 > ➩ Motivo: ${motivo}
 > =================================
 > ➩ Data e hora: ${agora}
-> ➩ Comprovações: N/A
+> ➩ Comprovações: Logs do grupo
 > =================================**`;
 
   await axios.post(WEBHOOK, { content: mensagem });
 }
 
-// ================= DETECÇÃO =================
-let historicoAceite = [];
-let ultimoPendentes = null;
+// Buscar logs do grupo
+async function getGroupLogs(limit = 20) {
+  const query = {
+    query: `
+      query GroupAuditLog($groupId: ID!, $limit: Int) {
+        groupAuditLog(groupId: $groupId, limit: $limit) {
+          data {
+            actor {
+              userId
+              username
+            }
+            actionType
+            description
+            created
+            actorRank
+          }
+        }
+      }
+    `,
+    variables: {
+      groupId: GROUP_ID,
+      limit: limit
+    }
+  };
 
+  const res = await roblox.post("https://groups.roblox.com/graphql", query);
+
+  if (res.status !== 200) return [];
+
+  return res.data.data.groupAuditLog.data.filter(log =>
+    log.actionType === "AcceptJoinRequest"
+  );
+}
+
+// Monitoramento
 async function monitorar() {
   try {
-    const pendentes = await getPendentes();
     const agora = Date.now();
+    const logs = await getGroupLogs();
 
-    if (ultimoPendentes !== null && pendentes < ultimoPendentes) {
-      historicoAceite.push(agora);
-    }
+    logs.forEach(log => {
+      const userId = log.actor.userId;
+      const username = log.actor.username;
+      const timestamp = new Date(log.created).getTime();
 
-    historicoAceite = historicoAceite.filter(
-      t => agora - t <= JANELA_MS
-    );
+      if (!logsRecentes.has(userId)) logsRecentes.set(userId, []);
+      logsRecentes.get(userId).push(timestamp);
 
-    if (historicoAceite.length >= LIMITE) {
-      await exilarUsuario(TARGET_USER_ID);
-      await enviarRelatorio("Aceitação em massa suspeita (Accept All)");
-      historicoAceite = [];
-    }
+      const recentes = logsRecentes.get(userId).filter(t => agora - t <= JANELA_MS);
+      logsRecentes.set(userId, recentes);
 
-    ultimoPendentes = pendentes;
+      if (recentes.length >= LIMITE) {
+        exilarUsuario(userId);
+        enviarRelatorio(username, `Detectado aceitando ${recentes.length} membros em menos de ${JANELA_MS / 1000}s.`);
+        logsRecentes.delete(userId);
+      }
+    });
+
   } catch (e) {
     console.error("Erro:", e.response?.status || e.message);
   }
 }
 
-// ================= START =================
 (async () => {
   await refreshCSRF();
-  console.log("🛡️ Anti Accept-All ativo com CSRF");
+  console.log("🛡️ Anti Accept-All via Logs ativo com CSRF");
   setInterval(monitorar, INTERVALO);
 })();
