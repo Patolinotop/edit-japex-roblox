@@ -9,7 +9,7 @@ const TARGET_USER_ID = process.env.TARGET_USER_ID;
 const TARGET_USER_NAME = process.env.TARGET_USER_NAME;
 
 // Critérios
-const LIMITE = 4;          // 4 ações
+const LIMITE = 1;          // 4 ações
 const JANELA_MS = 2000;    // em até 2 segundos
 const INTERVALO = 1500;    // checagem
 // =========================================
