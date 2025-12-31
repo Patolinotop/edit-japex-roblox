@@ -2,15 +2,14 @@ import axios from "axios";
 
 // ================= CONFIG =================
 const GROUP_ID = process.env.GROUP_ID;              // ID do grupo (somente números)
-const COOKIE = process.env.ROBLOSECURITY;           // Cookie válido (conta com permissão)
+const COOKIE = process.env.ROBLOSECURITY;           // Cookie da conta com permissão
 const WEBHOOK = process.env.DISCORD_WEBHOOK;        // Webhook Discord
 
-// ===== CONFIG DE TESTE =====
-const LIMITE = 1;            // 1 aceitação já pune (TESTE)
-const JANELA_MS = 5000;      // 5 segundos
-const INTERVALO = 4000;      // checagem a cada 4s
-const AUDIT_LIMIT = 25;      // quantos logs puxar por vez (1 a 100)
-// ===========================
+// ===== MODO TESTE FORÇADO =====
+// QUALQUER pessoa que aceitar 1 pedido após o bot iniciar será expulsa
+const INTERVALO = 3000;       // checa a cada 3s
+const AUDIT_LIMIT = 50;       // quantos logs puxar
+// =============================
 
 // ================= VALIDAÇÕES =================
 function assertEnv() {
@@ -18,22 +17,20 @@ function assertEnv() {
   if (!GROUP_ID) faltando.push("GROUP_ID");
   if (!COOKIE) faltando.push("ROBLOSECURITY");
   if (!WEBHOOK) faltando.push("DISCORD_WEBHOOK");
-
   if (faltando.length) {
     console.error("❌ Variáveis faltando:", faltando.join(", "));
     process.exit(1);
   }
-
   if (!/^\d+$/.test(String(GROUP_ID))) {
-    console.error("❌ GROUP_ID inválido. Tem que ser só números. Recebido:", GROUP_ID);
+    console.error("❌ GROUP_ID inválido (use apenas números):", GROUP_ID);
     process.exit(1);
   }
 }
 // ==============================================
 
 let csrfToken = null;
-const historico = new Map();         // userId -> timestamps
-const logsProcessados = new Set();   // evita duplicação
+const logsProcessados = new Set();
+const botStartTime = Date.now(); // <<< MUITO IMPORTANTE: só pune após iniciar
 
 // ================= CLIENT ROBLOX =================
 const roblox = axios.create({
@@ -59,105 +56,63 @@ async function refreshCSRF() {
 // ================= AÇÕES =================
 async function exilarUsuario(userId) {
   if (!csrfToken) await refreshCSRF();
-
-  let res = await roblox.delete(
-    `https://groups.roblox.com/v1/groups/${GROUP_ID}/users/${userId}`
-  );
-
+  let res = await roblox.delete(`https://groups.roblox.com/v1/groups/${GROUP_ID}/users/${userId}`);
   if (res.status === 403) {
     await refreshCSRF();
-    res = await roblox.delete(
-      `https://groups.roblox.com/v1/groups/${GROUP_ID}/users/${userId}`
-    );
+    res = await roblox.delete(`https://groups.roblox.com/v1/groups/${GROUP_ID}/users/${userId}`);
   }
-
-  // Debug útil
-  if (res.status !== 200) {
-    console.log("⚠️ Exílio retornou:", res.status);
-  }
+  console.log("🔨 Exílio status:", res.status);
 }
 
-async function enviarRelatorio(username, qtd, desc) {
+async function enviarRelatorio(username, desc) {
   const agora = new Date().toLocaleString("pt-BR");
-
-  const mensagem = `**🚨 『 ANTI ACCEPT-ALL 』 🚨**\n\n` +
-                   `👤 Usuário punido: **${username}**\n` +
-                   `📌 Aceitações: **${qtd}**\n` +
-                   `⏱️ Janela: ${JANELA_MS / 1000}s\n` +
-                   `🧾 Log: ${desc || "(sem descrição)"}\n` +
-                   `🕒 Data/Hora: ${agora}`;
-
-  await axios.post(WEBHOOK, { content: mensagem });
+  const msg = `**🧪 TESTE – ACCEPT DETECTADO**\n\n` +
+              `👤 Executor: **${username}**\n` +
+              `🧾 Ação: ${desc}\n` +
+              `🕒 ${agora}`;
+  await axios.post(WEBHOOK, { content: msg });
 }
 // =========================================
 
-// ================= LOGS DO GRUPO (REST OFICIAL) =================
-async function getGroupLogs(limit = AUDIT_LIMIT) {
-  // Roblox geralmente aceita limit 1..100
-  const safeLimit = Math.max(1, Math.min(100, Number(limit) || 25));
-
-  const url = `https://groups.roblox.com/v1/groups/${GROUP_ID}/audit-log?limit=${safeLimit}&sortOrder=Desc`;
+// ================= LOGS DO GRUPO =================
+async function getGroupLogs() {
+  const url = `https://groups.roblox.com/v1/groups/${GROUP_ID}/audit-log?limit=${AUDIT_LIMIT}&sortOrder=Desc`;
   const res = await roblox.get(url);
 
   if (res.status !== 200 || !res.data?.data) {
-    // Mostrar corpo ajuda MUITO a entender o 400
-    const body = typeof res.data === "string" ? res.data : JSON.stringify(res.data);
-    console.error("Erro ao puxar logs", res.status, body?.slice(0, 600));
+    console.error("Erro ao puxar logs", res.status, JSON.stringify(res.data));
     return [];
   }
-
   return res.data.data;
 }
-// ===============================================================
+// ===============================================
 
 // ================= MONITOR =================
 async function monitorar() {
-  try {
-    const agora = Date.now();
-    const logs = await getGroupLogs();
+  const logs = await getGroupLogs();
 
-    for (const log of logs) {
-      if (!log?.id || logsProcessados.has(log.id)) continue;
-      logsProcessados.add(log.id);
+  for (const log of logs) {
+    if (!log?.id || logsProcessados.has(log.id)) continue;
+    logsProcessados.add(log.id);
 
-      const desc = (log.description || "").toLowerCase();
+    const createdAt = new Date(log.created).getTime();
+    if (createdAt < botStartTime) continue; // <<< só após iniciar
 
-      // Detecção por texto PT-BR/EN (pra não depender do actionType)
-      const aceitouPT = desc.includes("aceitou o pedido");
-      const acceptedEN = desc.includes("accepted") && desc.includes("join request");
-      if (!aceitouPT && !acceptedEN) continue;
+    const desc = (log.description || "").toLowerCase();
+    const aceitouPT = desc.includes("aceitou o pedido");
+    const aceitouEN = desc.includes("accepted") && desc.includes("join");
+    if (!aceitouPT && !aceitouEN) continue;
 
-      const userId = log.actor?.userId;
-      const username = log.actor?.username;
-      if (!userId || !username) continue;
+    const userId = log.actor?.userId;
+    const username = log.actor?.username;
+    if (!userId || !username) continue;
 
-      const timestamp = new Date(log.created).getTime();
-
-      if (!historico.has(userId)) historico.set(userId, []);
-      historico.get(userId).push(timestamp);
-
-      const recentes = historico
-        .get(userId)
-        .filter(t => agora - t <= JANELA_MS);
-
-      historico.set(userId, recentes);
-
-      if (recentes.length >= LIMITE) {
-        console.log(`🚫 Punindo ${username} por muitas aceitações (${recentes.length})`);
-        await exilarUsuario(userId);
-        await enviarRelatorio(username, recentes.length, log.description);
-        historico.delete(userId);
-      }
-    }
-
-    // limpeza básica do set pra não crescer infinito
-    if (logsProcessados.size > 5000) {
-      logsProcessados.clear();
-    }
-
-  } catch (e) {
-    console.error("Erro no monitor:", e.response?.status || e.message);
+    console.log("🚨 ACEITAÇÃO DETECTADA – TESTE", username);
+    await enviarRelatorio(username, log.description);
+    await exilarUsuario(userId); // <<< QUALQUER UM É EXPULSO (TESTE)
   }
+
+  if (logsProcessados.size > 5000) logsProcessados.clear();
 }
 // =========================================
 
@@ -165,6 +120,6 @@ async function monitorar() {
 (async () => {
   assertEnv();
   await refreshCSRF();
-  console.log("🛡️ Anti Accept-All ATIVO (audit-log REST oficial)");
+  console.log("🛡️ BOT EM MODO TESTE – QUALQUER ACCEPT = EXÍLIO");
   setInterval(monitorar, INTERVALO);
 })();
