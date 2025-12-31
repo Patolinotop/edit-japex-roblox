@@ -5,29 +5,27 @@ import fs from "fs";
 import path from "path";
 import os from "os";
 
-// ================= CONFIG =================
+/* ================= CONFIG ================= */
 const GROUP_ID = process.env.GROUP_ID;
 const COOKIE = process.env.ROBLOSECURITY;
 const WEBHOOK = process.env.DISCORD_WEBHOOK;
 const OPENAI_KEY = process.env.OPENAI_API_KEY;
 
-const INTERVALO = 5000;      // 5s (teste)
+const INTERVALO = 5000;      // 5s teste
 const JANELA_MS = 10000;    // 10s
 const LIMITE_RAPIDO = 3;    // suspeito
-// =========================================
+/* ========================================= */
 
-// ================= VALIDACOES =================
 if (!GROUP_ID || !COOKIE || !WEBHOOK || !OPENAI_KEY) {
   console.error("❌ Variáveis de ambiente faltando");
   process.exit(1);
 }
-// ==============================================
 
 const openai = new OpenAI({ apiKey: OPENAI_KEY });
 const historico = new Map();
 let ultimoTexto = "";
 
-// ================= SCREENSHOT ESTAVEL =================
+/* ================= SCREENSHOT ================= */
 async function capturarAudit() {
   const userDataDir = path.join(os.tmpdir(), "pw-user-data");
 
@@ -70,20 +68,22 @@ async function capturarAudit() {
   await page.screenshot({ path: "audit.png" });
   await context.close();
 }
-// ======================================================
+/* ============================================= */
 
-// ================= IA (OCR) =================
+/* ================= OPENAI OCR ================= */
 async function analisarImagem() {
   const img = fs.readFileSync("audit.png");
+  const base64 = img.toString("base64");
 
-  const res = await openai.responses.create({
+  const response = await openai.responses.create({
     model: "gpt-4.1-mini",
-    input: [{
-      role: "user",
-      content: [
-        {
-          type: "input_text",
-          text:
+    input: [
+      {
+        role: "user",
+        content: [
+          {
+            type: "input_text",
+            text:
 `Leia o audit log do grupo Roblox.
 
 Retorne UMA ação por linha no formato:
@@ -94,21 +94,22 @@ Japex | aceitou | Player123
 
 Se não houver alterações, responda exatamente:
 SEM ALTERACOES`
-        },
-        {
-          type: "input_image",
-          image_base64: img.toString("base64")
-        }
-      ]
-    }]
+          },
+          {
+            type: "input_image",
+            image_url: `data:image/png;base64,${base64}`
+          }
+        ]
+      }
+    ]
   });
 
   fs.unlinkSync("audit.png");
-  return res.output_text.trim();
+  return response.output_text.trim();
 }
-// =============================================
+/* =============================================== */
 
-// ================= DISCORD =================
+/* ================= DISCORD ================= */
 async function enviarWebhook(responsavel, alvo, motivo) {
   const msg =
 `📄 **Relatório de Exílio!**
@@ -120,9 +121,9 @@ async function enviarWebhook(responsavel, alvo, motivo) {
 
   await axios.post(WEBHOOK, { content: msg });
 }
-// ===========================================
+/* =========================================== */
 
-// ================= MONITOR =================
+/* ================= MONITOR ================= */
 async function monitorar() {
   try {
     await capturarAudit();
@@ -156,12 +157,11 @@ async function monitorar() {
       await enviarWebhook(ator, alvo, motivo);
     }
 
-  } catch (e) {
-    console.error("Erro no monitor:", e.message);
+  } catch (err) {
+    console.error("Erro no monitor:", err.message);
   }
 }
-// ===========================================
+/* =========================================== */
 
-// ================= START =================
 console.log("🛡️ Auditoria visual Roblox ATIVA (modo teste)");
 setInterval(monitorar, INTERVALO);
