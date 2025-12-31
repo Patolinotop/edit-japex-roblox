@@ -2,6 +2,8 @@ import { chromium } from "playwright";
 import OpenAI from "openai";
 import axios from "axios";
 import fs from "fs";
+import path from "path";
+import os from "os";
 
 // ================= CONFIG =================
 const GROUP_ID = process.env.GROUP_ID;
@@ -11,46 +13,66 @@ const OPENAI_KEY = process.env.OPENAI_API_KEY;
 
 const INTERVALO = 5000;      // 5s (teste)
 const JANELA_MS = 10000;    // 10s
-const LIMITE_RAPIDO = 3;    // 3 ações rápidas
+const LIMITE_RAPIDO = 3;    // suspeito
 // =========================================
 
-const openai = new OpenAI({ apiKey: OPENAI_KEY });
+// ================= VALIDACOES =================
+if (!GROUP_ID || !COOKIE || !WEBHOOK || !OPENAI_KEY) {
+  console.error("❌ Variáveis de ambiente faltando");
+  process.exit(1);
+}
+// ==============================================
 
+const openai = new OpenAI({ apiKey: OPENAI_KEY });
 const historico = new Map();
 let ultimoTexto = "";
 
-// ================= SCREENSHOT =================
+// ================= SCREENSHOT ESTAVEL =================
 async function capturarAudit() {
-  const browser = await chromium.launch({
+  const userDataDir = path.join(os.tmpdir(), "pw-user-data");
+
+  const context = await chromium.launchPersistentContext(userDataDir, {
     headless: true,
-    args: ["--no-sandbox"]
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",
+      "--disable-gpu",
+      "--disable-software-rasterizer",
+      "--disable-extensions",
+      "--disable-background-networking",
+      "--disable-sync",
+      "--disable-translate",
+      "--disable-features=VizDisplayCompositor",
+      "--mute-audio"
+    ]
   });
 
-  const context = await browser.newContext({
-    storageState: {
-      cookies: [{
-        name: ".ROBLOSECURITY",
-        value: COOKIE,
-        domain: ".roblox.com",
-        path: "/"
-      }]
-    }
-  });
+  await context.addCookies([{
+    name: ".ROBLOSECURITY",
+    value: COOKIE,
+    domain: ".roblox.com",
+    path: "/",
+    httpOnly: true,
+    secure: true
+  }]);
 
   const page = await context.newPage();
+
   await page.goto(`https://www.roblox.com/groups/${GROUP_ID}/audit-log`, {
-    waitUntil: "networkidle"
+    waitUntil: "domcontentloaded",
+    timeout: 60000
   });
 
-  await page.reload();
+  await page.reload({ waitUntil: "domcontentloaded" });
   await page.waitForTimeout(3000);
 
   await page.screenshot({ path: "audit.png" });
-  await browser.close();
+  await context.close();
 }
-// =============================================
+// ======================================================
 
-// ================= IA =================
+// ================= IA (OCR) =================
 async function analisarImagem() {
   const img = fs.readFileSync("audit.png");
 
@@ -65,12 +87,12 @@ async function analisarImagem() {
 `Leia o audit log do grupo Roblox.
 
 Retorne UMA ação por linha no formato:
-APROVADOR | AÇÃO | ALVO
+RESPONSAVEL | ACAO | ALVO
 
 Exemplo:
 Japex | aceitou | Player123
 
-Se não houver mudanças, responda exatamente:
+Se não houver alterações, responda exatamente:
 SEM ALTERACOES`
         },
         {
@@ -84,13 +106,21 @@ SEM ALTERACOES`
   fs.unlinkSync("audit.png");
   return res.output_text.trim();
 }
-// =====================================
+// =============================================
 
 // ================= DISCORD =================
-async function enviarWebhook(conteudo) {
-  await axios.post(WEBHOOK, { content: conteudo });
+async function enviarWebhook(responsavel, alvo, motivo) {
+  const msg =
+`📄 **Relatório de Exílio!**
+
+👤 **Responsável:** ${responsavel}
+🚫 **Exilado(a):** ${alvo}
+📝 **Motivo:** ${motivo}
+🕒 **Data:** ${new Date().toLocaleString("pt-BR")}`;
+
+  await axios.post(WEBHOOK, { content: msg });
 }
-// =========================================
+// ===========================================
 
 // ================= MONITOR =================
 async function monitorar() {
@@ -98,7 +128,7 @@ async function monitorar() {
     await capturarAudit();
     const texto = await analisarImagem();
 
-    if (!texto || texto === ultimoTexto) return;
+    if (!texto || texto === ultimoTexto || texto === "SEM ALTERACOES") return;
     ultimoTexto = texto;
 
     const agora = Date.now();
@@ -119,27 +149,18 @@ async function monitorar() {
       historico.set(ator, recentes);
 
       let motivo = `${acao} ${alvo}`;
-
       if (recentes.length >= LIMITE_RAPIDO) {
         motivo += " (atividade rápida suspeita)";
       }
 
-      const relatorio =
-`📄 **Relatório de Exílio!**
-
-👤 **Responsável:** ${ator}
-🚫 **Exilado(a):** ${alvo}
-📝 **Motivo:** ${motivo}
-🕒 **Data:** ${new Date().toLocaleString("pt-BR")}`;
-
-      await enviarWebhook(relatorio);
+      await enviarWebhook(ator, alvo, motivo);
     }
 
   } catch (e) {
     console.error("Erro no monitor:", e.message);
   }
 }
-// =========================================
+// ===========================================
 
 // ================= START =================
 console.log("🛡️ Auditoria visual Roblox ATIVA (modo teste)");
