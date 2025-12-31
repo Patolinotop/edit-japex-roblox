@@ -5,7 +5,7 @@ const GROUP_ID = process.env.GROUP_ID;
 const COOKIE = process.env.ROBLOSECURITY;
 const WEBHOOK = process.env.DISCORD_WEBHOOK;
 
-const LIMITE = 2;            // Ações máximas permitidas na janela
+const LIMITE = 1;            // Ações máximas permitidas na janela
 const JANELA_MS = 2000;    // Janela de tempo (10 segundos)
 const INTERVALO = 5000;      // A cada 5 segundos
 // ==========================================
