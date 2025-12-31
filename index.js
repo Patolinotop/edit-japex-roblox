@@ -1,28 +1,33 @@
 import axios from "axios";
 
 // ================= CONFIG =================
-const GROUP_ID = process.env.GROUP_ID;
-const COOKIE = process.env.ROBLOSECURITY;
-const WEBHOOK = process.env.DISCORD_WEBHOOK;
+const GROUP_ID = process.env.GROUP_ID;              // ID do grupo
+const COOKIE = process.env.ROBLOSECURITY;           // Cookie da conta com permissão
+const WEBHOOK = process.env.DISCORD_WEBHOOK;        // Webhook Discord
 
-// TESTE: exila com 1 aceitação
-const LIMITE = 1;            // 1 aceitação já pune
-const JANELA_MS = 5000;      // 5 segundos
-const INTERVALO = 4000;      // checa a cada 4s
-// ==========================================
+// ===== CONFIG DE TESTE (AJUSTE MANUALMENTE) =====
+const LIMITE = 1;            // Quantas aceitações já punem (TESTE = 1)
+const JANELA_MS = 5000;      // Janela de tempo (ms)
+const INTERVALO = 4000;      // Intervalo de checagem (ms)
+// ================================================
 
+// ================= VARIÁVEIS =================
 let csrfToken = null;
-const historico = new Map(); // userId -> timestamps
-const processados = new Set(); // evita processar o mesmo log
+const historico = new Map();     // userId -> [timestamps]
+const logsProcessados = new Set(); // evita processar log repetido
+// ==============================================
 
+// ================= CLIENT ROBLOX =================
 const roblox = axios.create({
   headers: {
     Cookie: `.ROBLOSECURITY=${COOKIE}`,
     "Content-Type": "application/json",
-    "User-Agent": "RobloxBot/1.0"
+    "User-Agent": "RobloxBot/1.0",
+    "Referer": `https://www.roblox.com/groups/${GROUP_ID}/audit-log`
   },
   validateStatus: () => true
 });
+// ================================================
 
 // ================= CSRF =================
 async function refreshCSRF() {
@@ -30,6 +35,7 @@ async function refreshCSRF() {
   csrfToken = res.headers["x-csrf-token"];
   roblox.defaults.headers["X-CSRF-TOKEN"] = csrfToken;
 }
+// =========================================
 
 // ================= AÇÕES =================
 async function exilarUsuario(userId) {
@@ -50,16 +56,17 @@ async function exilarUsuario(userId) {
 async function enviarRelatorio(username, qtd) {
   const agora = new Date().toLocaleString("pt-BR");
 
-  const msg = `**🚨 ANTI ACCEPT-ALL 🚨**\n\n` +
-              `👤 Usuário: **${username}**\n` +
-              `📌 Ações detectadas: **${qtd} aceitações**\n` +
-              `⏱️ Janela: ${JANELA_MS / 1000}s\n` +
-              `🕒 Data/Hora: ${agora}`;
+  const mensagem = `**🚨 『 ANTI ACCEPT-ALL 』 🚨**\n\n` +
+                   `👤 Usuário punido: **${username}**\n` +
+                   `📌 Aceitações detectadas: **${qtd}**\n` +
+                   `⏱️ Janela: ${JANELA_MS / 1000}s\n` +
+                   `🕒 Data/Hora: ${agora}`;
 
-  await axios.post(WEBHOOK, { content: msg });
+  await axios.post(WEBHOOK, { content: mensagem });
 }
+// =========================================
 
-// ================= LOGS =================
+// ================= LOGS DO GRUPO =================
 async function getGroupLogs(limit = 20) {
   const payload = {
     query: `
@@ -68,7 +75,6 @@ async function getGroupLogs(limit = 20) {
           data {
             id
             created
-            actionType
             description
             actor {
               userId
@@ -86,13 +92,14 @@ async function getGroupLogs(limit = 20) {
 
   const res = await roblox.post("https://groups.roblox.com/graphql", payload);
 
-  if (res.status !== 200) {
+  if (res.status !== 200 || !res.data?.data) {
     console.error("Erro ao puxar logs", res.status);
     return [];
   }
 
   return res.data.data.groupAuditLog.data;
 }
+// ===============================================
 
 // ================= MONITOR =================
 async function monitorar() {
@@ -101,19 +108,20 @@ async function monitorar() {
     const logs = await getGroupLogs();
 
     for (const log of logs) {
-      if (processados.has(log.id)) continue;
-      processados.add(log.id);
+      if (!log?.id || logsProcessados.has(log.id)) continue;
+      logsProcessados.add(log.id);
 
-      // aceitações de pedido (confere por texto, mais confiável)
+      // DETECÇÃO POR TEXTO (mais confiável)
       if (!log.description?.toLowerCase().includes("aceitou o pedido")) continue;
 
       const userId = log.actor.userId;
       const username = log.actor.username;
-      const ts = new Date(log.created).getTime();
+      const timestamp = new Date(log.created).getTime();
 
       if (!historico.has(userId)) historico.set(userId, []);
 
-      historico.get(userId).push(ts);
+      historico.get(userId).push(timestamp);
+
       const recentes = historico
         .get(userId)
         .filter(t => agora - t <= JANELA_MS);
@@ -121,7 +129,7 @@ async function monitorar() {
       historico.set(userId, recentes);
 
       if (recentes.length >= LIMITE) {
-        console.log(`Punindo ${username} por accept-all`);
+        console.log(`🚫 Punindo ${username} por accept-all`);
         await exilarUsuario(userId);
         await enviarRelatorio(username, recentes.length);
         historico.delete(userId);
@@ -129,9 +137,10 @@ async function monitorar() {
     }
 
   } catch (e) {
-    console.error("Erro monitor:", e.message);
+    console.error("Erro no monitor:", e.message);
   }
 }
+// =========================================
 
 // ================= START =================
 (async () => {
