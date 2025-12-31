@@ -1,6 +1,6 @@
-import axios from "axios";
 import { chromium } from "playwright";
 import OpenAI from "openai";
+import axios from "axios";
 import fs from "fs";
 
 // ================= CONFIG =================
@@ -9,74 +9,22 @@ const COOKIE = process.env.ROBLOSECURITY;
 const WEBHOOK = process.env.DISCORD_WEBHOOK;
 const OPENAI_KEY = process.env.OPENAI_API_KEY;
 
-// ===== AJUSTES =====
-const LIMITE = 1;
-const JANELA_MS = 5000;
-const INTERVALO = 30000; // 30s
-// ===================
-
-// ================= VARIÁVEIS =================
-let csrfToken = null;
-const historico = new Map();
-const logsProcessados = new Set();
-// ============================================
-
-// ================= OPENAI =================
-const openai = new OpenAI({
-  apiKey: OPENAI_KEY
-});
-// ==========================================
-
-// ================= ROBLOX CLIENT =================
-const roblox = axios.create({
-  headers: {
-    Cookie: `.ROBLOSECURITY=${COOKIE}`,
-    "Content-Type": "application/json",
-    "User-Agent": "Mozilla/5.0",
-    "Referer": `https://www.roblox.com/groups/${GROUP_ID}/audit-log`
-  },
-  validateStatus: () => true
-});
-// ================================================
-
-// ================= CSRF =================
-async function refreshCSRF() {
-  const res = await roblox.post("https://auth.roblox.com/v2/logout");
-  csrfToken = res.headers["x-csrf-token"];
-  roblox.defaults.headers["X-CSRF-TOKEN"] = csrfToken;
-}
+const INTERVALO = 5000;      // 5s (teste)
+const JANELA_MS = 10000;    // 10s
+const LIMITE_RAPIDO = 3;    // 3 ações rápidas
 // =========================================
 
-// ================= PUNIÇÃO =================
-async function exilarUsuario(userId) {
-  if (!csrfToken) await refreshCSRF();
+const openai = new OpenAI({ apiKey: OPENAI_KEY });
 
-  let res = await roblox.delete(
-    `https://groups.roblox.com/v1/groups/${GROUP_ID}/users/${userId}`
-  );
-
-  if (res.status === 403) {
-    await refreshCSRF();
-    await roblox.delete(
-      `https://groups.roblox.com/v1/groups/${GROUP_ID}/users/${userId}`
-    );
-  }
-}
-
-async function enviarRelatorio(username, qtd) {
-  const msg =
-    `**🚨 ANTI ACCEPT-ALL 🚨**\n\n` +
-    `👤 Usuário: **${username}**\n` +
-    `📌 Aceitações: **${qtd}**\n` +
-    `⏱️ Janela: ${JANELA_MS / 1000}s`;
-
-  await axios.post(WEBHOOK, { content: msg });
-}
-// ==========================================
+const historico = new Map();
+let ultimoTexto = "";
 
 // ================= SCREENSHOT =================
 async function capturarAudit() {
-  const browser = await chromium.launch({ headless: true });
+  const browser = await chromium.launch({
+    headless: true,
+    args: ["--no-sandbox"]
+  });
 
   const context = await browser.newContext({
     storageState: {
@@ -90,11 +38,14 @@ async function capturarAudit() {
   });
 
   const page = await context.newPage();
-  await page.goto(`https://www.roblox.com/groups/${GROUP_ID}/audit-log`);
-  await page.waitForTimeout(4000);
+  await page.goto(`https://www.roblox.com/groups/${GROUP_ID}/audit-log`, {
+    waitUntil: "networkidle"
+  });
+
+  await page.reload();
+  await page.waitForTimeout(3000);
 
   await page.screenshot({ path: "audit.png" });
-
   await browser.close();
 }
 // =============================================
@@ -111,10 +62,16 @@ async function analisarImagem() {
         {
           type: "input_text",
           text:
-            "Leia o log de auditoria do grupo Roblox. " +
-            "Retorne apenas linhas no formato: " +
-            "`APROVADOR_USERNAME -> APROVADO_USERNAME`. " +
-            "Se não houver novas aceitações, responda 'NENHUMA'."
+`Leia o audit log do grupo Roblox.
+
+Retorne UMA ação por linha no formato:
+APROVADOR | AÇÃO | ALVO
+
+Exemplo:
+Japex | aceitou | Player123
+
+Se não houver mudanças, responda exatamente:
+SEM ALTERACOES`
         },
         {
           type: "input_image",
@@ -125,9 +82,15 @@ async function analisarImagem() {
   });
 
   fs.unlinkSync("audit.png");
-  return res.output_text;
+  return res.output_text.trim();
 }
 // =====================================
+
+// ================= DISCORD =================
+async function enviarWebhook(conteudo) {
+  await axios.post(WEBHOOK, { content: conteudo });
+}
+// =========================================
 
 // ================= MONITOR =================
 async function monitorar() {
@@ -135,29 +98,41 @@ async function monitorar() {
     await capturarAudit();
     const texto = await analisarImagem();
 
-    if (!texto || texto.includes("NENHUMA")) return;
+    if (!texto || texto === ultimoTexto) return;
+    ultimoTexto = texto;
 
     const agora = Date.now();
     const linhas = texto.split("\n");
 
     for (const linha of linhas) {
-      const [aprovador] = linha.split("->").map(t => t.trim());
-      if (!aprovador) continue;
+      if (!linha.includes("|")) continue;
 
-      if (!historico.has(aprovador)) historico.set(aprovador, []);
-      historico.get(aprovador).push(agora);
+      const [ator, acao, alvo] = linha.split("|").map(t => t.trim());
+
+      if (!historico.has(ator)) historico.set(ator, []);
+      historico.get(ator).push(agora);
 
       const recentes = historico
-        .get(aprovador)
+        .get(ator)
         .filter(t => agora - t <= JANELA_MS);
 
-      historico.set(aprovador, recentes);
+      historico.set(ator, recentes);
 
-      if (recentes.length >= LIMITE) {
-        console.log(`🚫 Detectado accept-all: ${aprovador}`);
-        await enviarRelatorio(aprovador, recentes.length);
-        historico.delete(aprovador);
+      let motivo = `${acao} ${alvo}`;
+
+      if (recentes.length >= LIMITE_RAPIDO) {
+        motivo += " (atividade rápida suspeita)";
       }
+
+      const relatorio =
+`📄 **Relatório de Exílio!**
+
+👤 **Responsável:** ${ator}
+🚫 **Exilado(a):** ${alvo}
+📝 **Motivo:** ${motivo}
+🕒 **Data:** ${new Date().toLocaleString("pt-BR")}`;
+
+      await enviarWebhook(relatorio);
     }
 
   } catch (e) {
@@ -167,8 +142,5 @@ async function monitorar() {
 // =========================================
 
 // ================= START =================
-(async () => {
-  await refreshCSRF();
-  console.log("🛡️ Auditoria visual do Roblox ATIVA");
-  setInterval(monitorar, INTERVALO);
-})();
+console.log("🛡️ Auditoria visual Roblox ATIVA (modo teste)");
+setInterval(monitorar, INTERVALO);
