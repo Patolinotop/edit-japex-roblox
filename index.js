@@ -15,17 +15,16 @@ const DISCORD_RESPONSAVEL_ID = "1455692969322614895";
 const INTERVALO = Number(process.env.INTERVALO_MS || "5000");
 const TEST_MODE = String(process.env.TEST_MODE || "1") === "1";
 
-// Anti-spam normal (quando TEST_MODE=0)
-const WINDOW_BURST_MS = 10_000;
+// regras (quando TEST_MODE=0)
+const BURST_WINDOW_MS = 10_000;
 const BURST_THRESHOLD = 3;
+
 const VOLUME_WINDOW_MS = 300_000; // 5 min
 const VOLUME_THRESHOLD = 10;
 
 const PUNISH_COOLDOWN_MS = 30 * 60 * 1000; // 30 min
 
-// Debug extra
-const DEBUG_EXILE = String(process.env.DEBUG_EXILE || "1") === "1";
-
+// URL audit (funciona mesmo se a UI te mandar pra /communities)
 const AUDIT_URL = `https://www.roblox.com/groups/configure?id=${GROUP_ID}#!/auditLog`;
 /* ========================================= */
 
@@ -45,47 +44,42 @@ if (COOKIE.startsWith(".ROBLOSECURITY=")) {
 
 const openai = new OpenAI({ apiKey: OPENAI_KEY });
 
-// Roblox HTTP client (exílio)
+// axios roblox (kick)
 let csrfToken = null;
 const roblox = axios.create({
   headers: {
     Cookie: `.ROBLOSECURITY=${COOKIE}`,
     "Content-Type": "application/json",
-    "User-Agent": "Mozilla/5.0",
-    "Referer": `https://www.roblox.com/groups/${GROUP_ID}/audit-log`
+    "User-Agent": "Mozilla/5.0"
   },
   validateStatus: () => true
 });
 
-// Estado
+// estado
 let running = false;
 let lastImgHash = "";
-let lastParsedLines = new Set();
-const actorEvents = new Map();
-const punishedUntil = new Map();
+let lastEventKeys = new Set();        // dedupe de eventos (actor|acao|quando)
+const actorTimes = new Map();         // actor -> timestamps
+const punishedUntil = new Map();      // actor -> cooldownUntil
 
-// Browser reusável
+// browser reuso
 let browser = null;
 let context = null;
 let page = null;
 
 /* ================= DISCORD ================= */
 async function sendDiscord(content) {
-  try {
-    await axios.post(WEBHOOK, { content });
-  } catch (e) {
-    console.error("Erro webhook:", e?.message || e);
-  }
+  await axios.post(WEBHOOK, { content });
 }
 
-function formatRelatorioExilio(exiladoUsername) {
+function formatRelatorioExilio(exilado) {
   const data = new Date().toLocaleDateString("pt-BR");
   return (
 `***Relatório de Exílio!
 
 Responsável: <@${DISCORD_RESPONSAVEL_ID}>
 
-Exilado(a): ${exiladoUsername}
+Exilado(a): ${exilado}
 
 Motivo: Aceppt-all
 
@@ -94,78 +88,80 @@ Data: ${data}***`
 }
 /* ========================================= */
 
-/* ================= ROBLOX CSRF / EXILAR ================= */
-// ✅ refresh CSRF que NÃO desloga: remove header antes de chamar /logout
+/* ================= ROBLOX AUTH/CSRF ================= */
 async function refreshCSRF() {
-  // garante que a chamada ao /logout vai dar 403 e devolver x-csrf-token,
-  // sem chance de "logout de verdade" por acidente
-  try {
-    delete roblox.defaults.headers.common["X-CSRF-TOKEN"];
-  } catch {}
-
   const res = await roblox.post("https://auth.roblox.com/v2/logout");
-
-  const token = res.headers["x-csrf-token"];
-  if (token) {
-    csrfToken = token;
-    roblox.defaults.headers.common["X-CSRF-TOKEN"] = csrfToken;
-  } else {
-    throw new Error("Não consegui obter x-csrf-token");
-  }
+  csrfToken = res.headers["x-csrf-token"];
+  if (csrfToken) roblox.defaults.headers["X-CSRF-TOKEN"] = csrfToken;
 }
 
-async function usernameToUserId(username) {
-  const res = await axios.post(
-    "https://users.roblox.com/v1/usernames/users",
-    { usernames: [username], excludeBannedUsers: false },
-    {
-      headers: { Cookie: `.ROBLOSECURITY=${COOKIE}`, "Content-Type": "application/json" },
-      validateStatus: () => true
-    }
-  );
-
-  const id = res?.data?.data?.[0]?.id;
-  return typeof id === "number" ? id : null;
-}
-
-// ✅ Checa se o userId realmente está no grupo antes de tentar exilar (evita 400)
-async function isUserInGroup(userId) {
-  const res = await axios.get(`https://groups.roblox.com/v2/users/${userId}/groups/roles`, {
-    headers: { Cookie: `.ROBLOSECURITY=${COOKIE}` },
-    validateStatus: () => true
-  });
-
-  if (res.status !== 200 || !res.data?.data) return false;
-
-  return res.data.data.some(item => item?.group?.id === Number(GROUP_ID));
-}
-
-async function exilarUsuarioPorId(userId) {
-  // garante token
-  if (!csrfToken) await refreshCSRF();
-
-  let res = await roblox.delete(`https://groups.roblox.com/v1/groups/${GROUP_ID}/users/${userId}`);
-
-  // 403 normalmente é CSRF
-  if (res.status === 403) {
-    await refreshCSRF();
-    res = await roblox.delete(`https://groups.roblox.com/v1/groups/${GROUP_ID}/users/${userId}`);
-  }
-
-  if (res.status < 200 || res.status >= 300) {
-    const body = typeof res.data === "string" ? res.data : JSON.stringify(res.data);
-    throw new Error(`Falha ao exilar (HTTP ${res.status}) body=${body}`);
-  }
-}
-/* ========================================= */
-
-/* ================= AUTH CHECK ================= */
 async function validarCookieHTTP() {
   const res = await axios.get("https://users.roblox.com/v1/users/authenticated", {
     headers: { Cookie: `.ROBLOSECURITY=${COOKIE}` },
     validateStatus: () => true
   });
-  return res.status === 200;
+  return res.status === 200 ? res.data : null;
+}
+/* ========================================= */
+
+/* ================= RESOLVER USERID ================= */
+// 1) tenta por username (preciso)
+async function usernameToUserId(username) {
+  const res = await axios.post(
+    "https://users.roblox.com/v1/usernames/users",
+    { usernames: [username], excludeBannedUsers: false },
+    { headers: { Cookie: `.ROBLOSECURITY=${COOKIE}` }, validateStatus: () => true }
+  );
+  const id = res?.data?.data?.[0]?.id;
+  return typeof id === "number" ? id : null;
+}
+
+// 2) fallback: search (pra quando OCR pegar display name)
+async function searchNameToUserId(name) {
+  const res = await axios.get(
+    `https://users.roblox.com/v1/users/search?keyword=${encodeURIComponent(name)}&limit=10`,
+    { headers: { Cookie: `.ROBLOSECURITY=${COOKIE}` }, validateStatus: () => true }
+  );
+
+  const data = res?.data?.data || [];
+  const lower = String(name).toLowerCase();
+
+  // tenta match exato em "name" ou "displayName"
+  const exact = data.find(u =>
+    String(u?.name || "").toLowerCase() === lower ||
+    String(u?.displayName || "").toLowerCase() === lower
+  );
+  if (exact?.id) return exact.id;
+
+  // senão pega o primeiro (melhor que nada)
+  return data?.[0]?.id ?? null;
+}
+
+async function resolveUserId(actorText) {
+  let id = await usernameToUserId(actorText);
+  if (id) return id;
+  id = await searchNameToUserId(actorText);
+  return id || null;
+}
+/* ========================================= */
+
+/* ================= KICK ================= */
+async function kickFromGroup(userId) {
+  if (!csrfToken) await refreshCSRF();
+
+  let res = await roblox.delete(`https://groups.roblox.com/v1/groups/${GROUP_ID}/users/${userId}`);
+
+  // se CSRF expirou, tenta renovar e repetir
+  if (res.status === 403 || res.status === 400) {
+    await refreshCSRF();
+    res = await roblox.delete(`https://groups.roblox.com/v1/groups/${GROUP_ID}/users/${userId}`);
+  }
+
+  if (res.status < 200 || res.status >= 300) {
+    // guarda resposta pra debug
+    const body = typeof res.data === "string" ? res.data : JSON.stringify(res.data);
+    throw new Error(`Falha ao exilar (HTTP ${res.status}) ${body?.slice(0, 180) || ""}`);
+  }
 }
 /* ========================================= */
 
@@ -194,6 +190,7 @@ async function initBrowser() {
   }]);
 
   page = await context.newPage();
+
   await page.goto("https://www.roblox.com/home", { waitUntil: "domcontentloaded", timeout: 60000 });
   await page.waitForTimeout(1200);
 
@@ -201,10 +198,10 @@ async function initBrowser() {
     const r = await fetch("https://users.roblox.com/v1/users/authenticated", { credentials: "include" });
     return r.status;
   });
-  if (status !== 200) throw new Error("Cookie não logou no navegador (inválido/expirado/sem permissão).");
+  if (status !== 200) throw new Error("Cookie não logou no navegador (inválido/expirado).");
 
   await page.goto(AUDIT_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
-  await page.waitForTimeout(1200);
+  await page.waitForTimeout(1500);
 }
 
 function sha256File(filepath) {
@@ -214,49 +211,50 @@ function sha256File(filepath) {
 
 async function capturarAudit() {
   if (!page || page.isClosed()) await initBrowser();
-
   try {
     await page.reload({ waitUntil: "domcontentloaded", timeout: 60000 });
   } catch {
     await initBrowser();
     await page.reload({ waitUntil: "domcontentloaded", timeout: 60000 });
   }
-
-  await page.waitForTimeout(1800);
+  await page.waitForTimeout(1500);
   await page.screenshot({ path: "audit.png" });
 }
 /* ========================================= */
 
-/* ================= OPENAI OCR ================= */
-async function ocrAuditToLines() {
+/* ================= OCR (OpenAI) ================= */
+async function ocrAuditEvents() {
   const base64 = fs.readFileSync("audit.png").toString("base64");
 
   const resp = await openai.responses.create({
     model: "gpt-4.1-mini",
-    max_output_tokens: 220,
-    input: [
-      {
-        role: "user",
-        content: [
-          {
-            type: "input_text",
-            text:
-`Você está vendo um Audit Log de grupo Roblox.
+    max_output_tokens: 250,
+    input: [{
+      role: "user",
+      content: [
+        {
+          type: "input_text",
+          text:
+`Você está vendo um Audit Log de comunidade/grupo Roblox.
 
 Extraia SOMENTE eventos de aprovação/recusa de pedidos de entrada.
 Retorne UMA linha por evento no formato:
 
-ATOR | ACAO
+ATOR | ACAO | QUANDO
 
-Onde ACAO é apenas: "aceitou" ou "recusou".
+- ACAO deve ser apenas: aceitou ou recusou
+- QUANDO é o texto de tempo visível na linha (ex: "00:51" / "1 min" / "há 2 minutos" etc). Se não existir, use "sem_tempo".
+
+Exemplos:
+cami_hudson | aceitou | 00:51
+moderadorX | recusou | 1 min
 
 Se não houver eventos desse tipo visíveis, responda exatamente:
 SEM ALTERACOES`
-          },
-          { type: "input_image", image_url: `data:image/png;base64,${base64}` }
-        ]
-      }
-    ]
+        },
+        { type: "input_image", image_url: `data:image/png;base64,${base64}` }
+      ]
+    }]
   });
 
   const text = (resp.output_text || "").trim();
@@ -268,81 +266,73 @@ SEM ALTERACOES`
     .filter(Boolean)
     .filter(l => l.includes("|"))
     .map(l => {
-      const [actor, action] = l.split("|").map(x => x.trim());
-      return `${actor} | ${action}`;
-    });
+      const parts = l.split("|").map(x => x.trim());
+      const actor = parts[0] || "";
+      const action = (parts[1] || "").toLowerCase();
+      const when = parts[2] || "sem_tempo";
+      return { actor, action, when };
+    })
+    .filter(e => e.actor && (e.action === "aceitou" || e.action === "recusou"));
 }
 /* ========================================= */
 
-/* ================= DETECÇÃO + PUNIÇÃO ================= */
-function nowMs() { return Date.now(); }
+/* ================= DETECÇÃO ================= */
+function now() { return Date.now(); }
 
-function canPunish(actor) {
-  const until = punishedUntil.get(actor) || 0;
-  return nowMs() >= until;
-}
+function recordActor(actor) {
+  const t = now();
+  if (!actorTimes.has(actor)) actorTimes.set(actor, []);
+  actorTimes.get(actor).push(t);
 
-function markPunished(actor) {
-  punishedUntil.set(actor, nowMs() + PUNISH_COOLDOWN_MS);
-}
-
-function recordEvent(actor) {
-  const t = nowMs();
-  if (!actorEvents.has(actor)) actorEvents.set(actor, []);
-  actorEvents.get(actor).push(t);
-
+  // limpa > 5min
   const cutoff = t - VOLUME_WINDOW_MS;
-  actorEvents.set(actor, actorEvents.get(actor).filter(x => x >= cutoff));
-  return actorEvents.get(actor);
+  actorTimes.set(actor, actorTimes.get(actor).filter(x => x >= cutoff));
+
+  return actorTimes.get(actor);
 }
 
 function shouldPunish(actor) {
   if (TEST_MODE) return true;
 
-  const t = nowMs();
-  const arr = actorEvents.get(actor) || [];
+  const t = now();
+  const arr = actorTimes.get(actor) || [];
+  const burst = arr.filter(x => x >= t - BURST_WINDOW_MS).length;
+  const vol = arr.filter(x => x >= t - VOLUME_WINDOW_MS).length;
 
-  const burst = arr.filter(x => x >= t - WINDOW_BURST_MS).length;
-  const volume = arr.length;
-
-  return burst >= BURST_THRESHOLD || volume >= VOLUME_THRESHOLD;
+  return burst >= BURST_THRESHOLD || vol >= VOLUME_THRESHOLD;
 }
 
-async function punishActor(actorUsername) {
-  if (!canPunish(actorUsername)) return;
+function canPunish(actor) {
+  return (punishedUntil.get(actor) || 0) <= now();
+}
 
-  const userId = await usernameToUserId(actorUsername);
-  if (!userId) {
-    await sendDiscord(formatRelatorioExilio(actorUsername) + `\n\n(⚠️ Não consegui resolver userId.)`);
-    markPunished(actorUsername);
-    return;
-  }
+function markPunished(actor) {
+  punishedUntil.set(actor, now() + PUNISH_COOLDOWN_MS);
+}
+/* ========================================= */
 
-  // ✅ evita 400: só tenta exilar se estiver no grupo
-  const inGroup = await isUserInGroup(userId);
-  if (!inGroup) {
-    if (DEBUG_EXILE) {
-      await sendDiscord(
-        `⚠️ DEBUG: tentei exilar "${actorUsername}" (id ${userId}), mas ele NÃO aparece como membro do grupo ${GROUP_ID}. (evitei HTTP 400)`
-      );
-    }
-    // não marca punish aqui, pra não “travar” caso o OCR tenha errado uma vez
-    return;
-  }
+/* ================= PUNIR ================= */
+async function punishActor(actor) {
+  if (!canPunish(actor)) return;
+
+  // manda SEMPRE o relatório no formato exato
+  await sendDiscord(formatRelatorioExilio(actor));
 
   try {
-    await exilarUsuarioPorId(userId);
-    await sendDiscord(formatRelatorioExilio(actorUsername));
-    markPunished(actorUsername);
-  } catch (e) {
-    const msg = String(e?.message || e);
-    console.error("Erro exilar:", msg);
+    const userId = await resolveUserId(actor);
+    if (!userId) throw new Error("Não consegui resolver userId (username/displayName).");
 
-    // manda o body do erro (sem spam) pra você ver exatamente o motivo do 400
-    if (DEBUG_EXILE) {
-      await sendDiscord(`⚠️ DEBUG EXILE: ${msg}`.slice(0, 1900));
-    }
+    await kickFromGroup(userId);
+  } catch (e) {
+    // manda debug em outra msg (pra não quebrar seu formato)
+    await sendDiscord(
+      `⚠️ Exílio automático falhou para **${actor}**.\n` +
+      `Motivo provável: permissão da conta do cookie / actor veio como display name / user não é membro.\n` +
+      `Erro: ${String(e?.message || e).slice(0, 500)}`
+    );
   }
+
+  markPunished(actor);
 }
 /* ========================================= */
 
@@ -361,25 +351,24 @@ async function monitorar() {
     }
     lastImgHash = h;
 
-    const lines = await ocrAuditToLines();
+    const events = await ocrAuditEvents();
+
     try { fs.unlinkSync("audit.png"); } catch {}
 
-    if (!lines.length) return;
+    if (!events.length) return;
 
-    const newLines = lines.filter(l => !lastParsedLines.has(l));
-    lastParsedLines = new Set(lines);
+    // dedupe por chave "actor|action|when"
+    const currentKeys = new Set(events.map(e => `${e.actor}|${e.action}|${e.when}`));
+    const newKeys = [...currentKeys].filter(k => !lastEventKeys.has(k));
+    lastEventKeys = currentKeys;
 
-    if (!newLines.length) return;
+    if (!newKeys.length) return;
 
-    for (const l of newLines) {
-      const [actorRaw, actionRaw] = l.split("|").map(x => x.trim());
-      const actor = actorRaw;
-      const action = (actionRaw || "").toLowerCase();
+    for (const k of newKeys) {
+      const [actor, action] = k.split("|").map(x => x.trim());
+      recordActor(actor);
 
-      if (action !== "aceitou" && action !== "recusou") continue;
-
-      recordEvent(actor);
-
+      // tanto aceitou quanto recusou contam como spam/all
       if (shouldPunish(actor)) {
         await punishActor(actor);
       }
@@ -393,16 +382,13 @@ async function monitorar() {
 }
 
 (async () => {
-  const ok = await validarCookieHTTP();
-  if (!ok) {
+  const me = await validarCookieHTTP();
+  if (!me) {
     await sendDiscord("❌ ROBLOSECURITY inválido/expirado. Atualize o cookie.");
     process.exit(1);
   }
 
-  // pega CSRF “sem deslogar”
   await refreshCSRF();
-
-  // browser
   await initBrowser();
 
   console.log(`🛡️ Anti Accept/Recuse-all ATIVO | TEST_MODE=${TEST_MODE} | INTERVALO=${INTERVALO}ms`);
