@@ -14,19 +14,27 @@ const OPENAI_KEY = process.env.OPENAI_API_KEY;
 
 const DISCORD_RESPONSAVEL_ID = "1455692969322614895";
 
-const INTERVALO = Number(process.env.INTERVALO_MS || "300000"); // 5 min
+// Intervalo default: 5 min
+const INTERVALO = Number(process.env.INTERVALO_MS || "300000");
+
+// Test mode (padrão OFF)
 const TEST_MODE = String(process.env.TEST_MODE || "0") === "1";
+
+// Regra: 3+ ações no mesmo minuto pelo mesmo usuário => exílio
 const SAME_MINUTE_THRESHOLD = Number(process.env.SAME_MINUTE_THRESHOLD || "3");
 
+// Cooldown pra não punir em loop
 const PUNISH_COOLDOWN_MS = 30 * 60 * 1000;
 
+// URL audit
 const AUDIT_URL = `https://www.roblox.com/groups/configure?id=${GROUP_ID}#!/auditLog`;
 
-// Modelo “mais carinho” sem raciocínio pesado
+// Modelo de visão (recomendado)
 const VISION_MODEL = process.env.VISION_MODEL || "gpt-4.1";
 
-// Robustez / retry
+// Robustez
 const CAPTURE_RETRIES = Number(process.env.CAPTURE_RETRIES || "3");
+const OCR_RETRIES = Number(process.env.OCR_RETRIES || "3");
 const RETRY_DELAY_MS = Number(process.env.RETRY_DELAY_MS || "2500");
 const NAV_TIMEOUT_MS = Number(process.env.NAV_TIMEOUT_MS || "60000");
 const SHORT_WAIT_MS = Number(process.env.SHORT_WAIT_MS || "1200");
@@ -48,7 +56,40 @@ if (COOKIE.startsWith(".ROBLOSECURITY=")) {
 
 const openai = new OpenAI({ apiKey: OPENAI_KEY });
 
-/* ================= DISCORD (com print opcional) ================= */
+/* ================= HELPERS ================= */
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+function sha256File(filepath) {
+  const buf = fs.readFileSync(filepath);
+  return crypto.createHash("sha256").update(buf).digest("hex");
+}
+
+function rotateScreenshots() {
+  // mantém só 2 arquivos: prev e last
+  try {
+    if (fs.existsSync("audit_last.png")) {
+      try { fs.unlinkSync("audit_prev.png"); } catch {}
+      fs.renameSync("audit_last.png", "audit_prev.png");
+    }
+    fs.renameSync("audit_new.png", "audit_last.png");
+  } catch (e) {
+    console.error("⚠️ Falha rotacionando prints:", String(e?.message || e));
+  }
+}
+
+function normalizeMinuteKey(whenRaw) {
+  const w = String(whenRaw || "").trim();
+  const hm = w.match(/(\d{1,2}:\d{2})/);
+  return hm ? hm[1] : "unknown";
+}
+
+function isLikelyUsername(s) {
+  const t = String(s || "").trim().replace(/^@/, "");
+  return /^[a-zA-Z0-9_]{3,20}$/.test(t);
+}
+/* ========================================= */
+
+/* ================= DISCORD ================= */
 async function sendDiscord(content, imagePath = null) {
   try {
     if (!imagePath) {
@@ -64,7 +105,7 @@ async function sendDiscord(content, imagePath = null) {
 
     if (res.status === 429) {
       const retryAfter = Number(res.headers["retry-after"]) || 1;
-      await new Promise(r => setTimeout(r, retryAfter * 1000));
+      await sleep(retryAfter * 1000);
       await axios.post(WEBHOOK, form, { headers: form.getHeaders(), validateStatus: () => true });
     }
   } catch (e) {
@@ -95,11 +136,11 @@ let baselineReady = false;
 let lastImgHash = "";
 let lastEventKeys = new Set();
 
-const punishedUntil = new Map();
-const actorMinuteCounts = new Map();
+const punishedUntil = new Map();     // actorKey -> cooldownUntil
+const actorMinuteCounts = new Map(); // actorKey -> Map(minuteKey -> count)
 /* ========================================= */
 
-/* ================= PLAYWRIGHT ================= */
+/* ================= PLAYWRIGHT SETUP ================= */
 function ensurePlaywrightBrowsersInstalled() {
   try {
     console.log("🔧 Instalando browsers do Playwright (firefox)...");
@@ -134,6 +175,22 @@ async function refreshCSRF() {
 async function authStatus() {
   const res = await api.get("https://users.roblox.com/v1/users/authenticated");
   return res.status();
+}
+
+async function ensureEntryRequestFilter() {
+  // Melhor esforço: se não achar, OCR já filtra por texto "pedido de entrada"
+  try {
+    const tudo = page.getByText("Tudo", { exact: true }).first();
+    if (await tudo.count()) {
+      await tudo.click({ timeout: 1500 }).catch(() => {});
+      await page.waitForTimeout(250);
+    }
+    const opt = page.getByText("Aceitar pedido de entrada", { exact: false }).first();
+    if (await opt.count()) {
+      await opt.click({ timeout: 1500 }).catch(() => {});
+      await page.waitForTimeout(350);
+    }
+  } catch {}
 }
 
 async function initBrowser() {
@@ -175,7 +232,7 @@ async function initBrowser() {
   await page.waitForTimeout(SHORT_WAIT_MS);
 
   const s = await authStatus();
-  if (s !== 200) throw new Error(`ROBLOSECURITY inválido/expirado (status ${s}).`);
+  if (s !== 200) throw new Error(`ROBLOSECURITY(all) inválido/expirado (status ${s}).`);
 
   await refreshCSRF();
 
@@ -186,40 +243,7 @@ async function initBrowser() {
   await ensureEntryRequestFilter();
 }
 
-async function ensureEntryRequestFilter() {
-  // Melhor esforço: se não achar, OCR já filtra por “pedido de entrada”
-  try {
-    const tudo = page.getByText("Tudo", { exact: true }).first();
-    if (await tudo.count()) {
-      await tudo.click({ timeout: 1500 }).catch(() => {});
-      await page.waitForTimeout(250);
-    }
-    const opt = page.getByText("Aceitar pedido de entrada", { exact: false }).first();
-    if (await opt.count()) {
-      await opt.click({ timeout: 1500 }).catch(() => {});
-      await page.waitForTimeout(350);
-    }
-  } catch {}
-}
-
-function rotateScreenshots() {
-  try {
-    if (fs.existsSync("audit_last.png")) {
-      try { fs.unlinkSync("audit_prev.png"); } catch {}
-      fs.renameSync("audit_last.png", "audit_prev.png");
-    }
-    fs.renameSync("audit_new.png", "audit_last.png");
-  } catch (e) {
-    console.error("⚠️ Falha rotacionando prints:", String(e?.message || e));
-  }
-}
-
-function sha256File(filepath) {
-  const buf = fs.readFileSync(filepath);
-  return crypto.createHash("sha256").update(buf).digest("hex");
-}
-
-// ✅ captura com retry + fallback (reload -> goto)
+// captura com retry + fallback reload->goto, e se falhar reinicia browser
 async function capturarAuditRobusto() {
   if (!page || page.isClosed()) await initBrowser();
 
@@ -227,11 +251,9 @@ async function capturarAuditRobusto() {
     try {
       console.log(`📸 Captura tentativa ${attempt}/${CAPTURE_RETRIES}...`);
 
-      // tenta reload
       try {
         await page.reload({ waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS });
       } catch {
-        // fallback goto
         await page.goto(AUDIT_URL, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS });
       }
 
@@ -246,10 +268,8 @@ async function capturarAuditRobusto() {
       return;
     } catch (e) {
       console.error(`⚠️ Falha captura (tentativa ${attempt}):`, String(e?.message || e));
-
-      // reinicia o browser e tenta de novo na mesma execução
       try { await closeSilently(); } catch {}
-      await new Promise(r => setTimeout(r, RETRY_DELAY_MS));
+      await sleep(RETRY_DELAY_MS);
       await initBrowser();
     }
   }
@@ -258,77 +278,78 @@ async function capturarAuditRobusto() {
 }
 /* ========================================= */
 
-/* ================= OCR (FILTRO FORTE) ================= */
-function isLikelyUsername(s) {
-  const t = String(s || "").trim().replace(/^@/, "");
-  return /^[a-zA-Z0-9_]{3,20}$/.test(t);
-}
-
-function normalizeMinuteKey(whenRaw) {
-  const w = String(whenRaw || "").trim();
-  const hm = w.match(/(\d{1,2}:\d{2})/);
-  return hm ? hm[1] : "unknown";
-}
-
+/* ================= OCR (RETRY + NÃO DERRUBA LOOP) ================= */
 async function ocrAuditEvents() {
   const base64 = fs.readFileSync("audit_last.png").toString("base64");
 
-  console.log("🧠 Enviando imagem para OpenAI OCR...");
-  const resp = await openai.responses.create({
-    model: VISION_MODEL,
-    max_output_tokens: 220,
-    input: [{
-      role: "user",
-      content: [
-        {
-          type: "input_text",
-          text:
+  for (let attempt = 1; attempt <= OCR_RETRIES; attempt++) {
+    try {
+      console.log(`🧠 OCR tentativa ${attempt}/${OCR_RETRIES}...`);
+
+      const resp = await openai.responses.create({
+        model: VISION_MODEL,
+        max_output_tokens: 220,
+        timeout: 60_000,
+        input: [{
+          role: "user",
+          content: [
+            {
+              type: "input_text",
+              text:
 `Você está vendo a página "Atividade do grupo" (audit log) do Roblox.
 
 Extraia SOMENTE eventos de PEDIDO DE ENTRADA:
 - "aceitou o pedido de entrada"
 - "recusou o pedido de entrada"
 
-IGNORE COMPLETAMENTE:
+IGNORE:
 - mudança de cargo
-- remoção/ban
+- remover/ban/desban
 - qualquer outra ação
 
 Só inclua se tiver explicitamente "pedido de entrada" na descrição.
 
-Formato (1 linha por evento):
+Formato:
 NOME | ACAO | QUANDO
 
-- NOME: use @username (sem "@") se visível; senão use display name
+- NOME: use @username (sem "@") se visível; senão display name
 - ACAO: aceitou ou recusou
 - QUANDO: copie o tempo visível (ideal HH:MM)
 
 Se não houver, responda exatamente:
 SEM ALTERACOES`
-        },
-        { type: "input_image", image_url: `data:image/png;base64,${base64}` }
-      ]
-    }]
-  });
+            },
+            { type: "input_image", image_url: `data:image/png;base64,${base64}` }
+          ]
+        }]
+      });
 
-  const text = (resp.output_text || "").trim();
-  console.log("✅ OCR retornou:", text ? text.slice(0, 120) : "(vazio)");
+      const text = (resp.output_text || "").trim();
+      console.log("✅ OCR retornou:", text ? text.slice(0, 120) : "(vazio)");
 
-  if (!text || text === "SEM ALTERACOES") return [];
+      if (!text || text === "SEM ALTERACOES") return [];
 
-  return text
-    .split("\n")
-    .map(l => l.trim())
-    .filter(Boolean)
-    .filter(l => l.includes("|"))
-    .map(l => {
-      const [nameRaw, actionRaw, whenRaw] = l.split("|").map(x => x.trim());
-      const name = (nameRaw || "").replace(/^@/g, "").trim();
-      const action = (actionRaw || "").toLowerCase();
-      const when = whenRaw || "sem_tempo";
-      return { name, action, when, minuteKey: normalizeMinuteKey(whenRaw) };
-    })
-    .filter(e => e.name && (e.action === "aceitou" || e.action === "recusou"));
+      return text
+        .split("\n")
+        .map(l => l.trim())
+        .filter(Boolean)
+        .filter(l => l.includes("|"))
+        .map(l => {
+          const [nameRaw, actionRaw, whenRaw] = l.split("|").map(x => x.trim());
+          const name = (nameRaw || "").replace(/^@/g, "").trim();
+          const action = (actionRaw || "").toLowerCase();
+          const when = whenRaw || "sem_tempo";
+          return { name, action, when, minuteKey: normalizeMinuteKey(whenRaw) };
+        })
+        .filter(e => e.name && (e.action === "aceitou" || e.action === "recusou"));
+    } catch (e) {
+      console.error(`⚠️ OCR falhou (tentativa ${attempt}):`, String(e?.message || e));
+      await sleep(3000);
+    }
+  }
+
+  console.error("❌ OCR falhou em todas as tentativas. Pulando este ciclo.");
+  return [];
 }
 /* ========================================= */
 
@@ -459,8 +480,6 @@ async function punishActor(actorKey) {
   }
 
   markPunished(actorKey);
-
-  // relatório + print
   await sendDiscord(formatRelatorioExilio(usernameForReport), "audit_last.png");
 }
 /* ========================================= */
@@ -482,11 +501,10 @@ async function monitorar() {
 
     const events = await ocrAuditEvents();
 
-    // baseline
     if (!baselineReady) {
       lastEventKeys = new Set(events.map(e => `${e.name}|${e.action}|${e.when}`));
       baselineReady = true;
-      console.log("✅ Baseline setado (OCR realizado). Próximas mudanças serão avaliadas.");
+      console.log("✅ Baseline setado (OCR feito com sucesso).");
       return;
     }
 
@@ -519,7 +537,8 @@ async function monitorar() {
     }
   } catch (err) {
     console.error("Erro no monitor:", String(err?.message || err));
-    // se der erro, reinicia browser pra próxima execução
+    // ✅ NÃO fecha browser por erro de OCR (OCR já trata). Só fecha se monitor inteiro falhar.
+    // Reabrirá na próxima tentativa
     try { await closeSilently(); } catch {}
   } finally {
     running = false;
@@ -535,10 +554,8 @@ process.on("uncaughtException", (err) => console.error("UncaughtException:", err
 
   console.log(`🛡️ Rodando | MODEL=${VISION_MODEL} | TEST_MODE=${TEST_MODE} | INTERVALO=${INTERVALO}ms`);
   console.log(`✅ Regra: >=${SAME_MINUTE_THRESHOLD} ações (aceitar/recusar pedido de entrada) no mesmo minuto => exílio.`);
-  console.log("ℹ️ Primeira execução faz baseline (e força OCR se conseguir capturar).");
+  console.log("ℹ️ Primeira execução faz baseline.");
 
-  // baseline imediato (com retry robusto)
-  await monitorar();
-
+  await monitorar(); // baseline
   setInterval(monitorar, INTERVALO);
 })();
