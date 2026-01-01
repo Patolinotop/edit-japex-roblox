@@ -4,22 +4,6 @@ import axios from "axios";
 import fs from "fs";
 import crypto from "crypto";
 
-/* ================= SAFETY (anti-crash silencioso) ================= */
-process.env.PLAYWRIGHT_BROWSERS_PATH = process.env.PLAYWRIGHT_BROWSERS_PATH || "/ms-playwright";
-
-process.on("uncaughtException", (err) => {
-  console.error("❌ Uncaught Exception:", err);
-});
-
-process.on("unhandledRejection", (err) => {
-  console.error("❌ Unhandled Rejection:", err);
-});
-
-process.on("exit", (code) => {
-  console.log("⚠️ Processo finalizado com código:", code);
-});
-/* ================================================================ */
-
 /* ================= CONFIG ================= */
 const GROUP_ID = process.env.GROUP_ID;
 let COOKIE = process.env.ROBLOSECURITY;
@@ -28,22 +12,20 @@ const OPENAI_KEY = process.env.OPENAI_API_KEY;
 
 const DISCORD_RESPONSAVEL_ID = "1455692969322614895";
 
-// Intervalo (teste: 5000; produção: 300000)
 const INTERVALO = Number(process.env.INTERVALO_MS || "5000");
-
-// Test mode: 1 ação já exila
 const TEST_MODE = String(process.env.TEST_MODE || "1") === "1";
 
 // Anti-spam normal (quando TEST_MODE=0)
-const WINDOW_BURST_MS = 10_000;     // janela curta
-const BURST_THRESHOLD = 3;          // 3 ações em 10s
-const VOLUME_WINDOW_MS = 300_000;   // 5 min
-const VOLUME_THRESHOLD = 10;        // 10 ações em 5 min
+const WINDOW_BURST_MS = 10_000;
+const BURST_THRESHOLD = 3;
+const VOLUME_WINDOW_MS = 300_000; // 5 min
+const VOLUME_THRESHOLD = 10;
 
 const PUNISH_COOLDOWN_MS = 30 * 60 * 1000; // 30 min
-const DEBUG_EXILE = String(process.env.DEBUG_EXILE || "0") === "1";
 
-// URL do audit log
+// Debug extra
+const DEBUG_EXILE = String(process.env.DEBUG_EXILE || "1") === "1";
+
 const AUDIT_URL = `https://www.roblox.com/groups/configure?id=${GROUP_ID}#!/auditLog`;
 /* ========================================= */
 
@@ -63,7 +45,7 @@ if (COOKIE.startsWith(".ROBLOSECURITY=")) {
 
 const openai = new OpenAI({ apiKey: OPENAI_KEY });
 
-// Roblox client (exílio)
+// Roblox HTTP client (exílio)
 let csrfToken = null;
 const roblox = axios.create({
   headers: {
@@ -78,9 +60,9 @@ const roblox = axios.create({
 // Estado
 let running = false;
 let lastImgHash = "";
-let lastParsedLines = new Set(); // linhas OCR anteriores
-const actorEvents = new Map();   // actor -> [timestamps]
-const punishedUntil = new Map(); // actor -> timestampUntil
+let lastParsedLines = new Set();
+const actorEvents = new Map();
+const punishedUntil = new Map();
 
 // Browser reusável
 let browser = null;
@@ -112,24 +94,24 @@ Data: ${data}***`
 }
 /* ========================================= */
 
-/* ================= UTIL: PEGAR USERNAME REAL ================= */
-function normalizeUsernameFromActor(raw) {
-  const s = String(raw || "").trim();
-  const m = s.match(/@([A-Za-z0-9_]{3,20})/);
-  if (m?.[1]) return m[1];
-  const token = s.replace(/^@/, "").trim();
-  return token.split(/\s+/)[0].replace(/[^A-Za-z0-9_]/g, "");
-}
-/* ========================================= */
-
 /* ================= ROBLOX CSRF / EXILAR ================= */
+// ✅ refresh CSRF que NÃO desloga: remove header antes de chamar /logout
 async function refreshCSRF() {
-  try { delete roblox.defaults.headers.common["X-CSRF-TOKEN"]; } catch {}
+  // garante que a chamada ao /logout vai dar 403 e devolver x-csrf-token,
+  // sem chance de "logout de verdade" por acidente
+  try {
+    delete roblox.defaults.headers.common["X-CSRF-TOKEN"];
+  } catch {}
+
   const res = await roblox.post("https://auth.roblox.com/v2/logout");
+
   const token = res.headers["x-csrf-token"];
-  if (!token) throw new Error("Não consegui obter x-csrf-token");
-  csrfToken = token;
-  roblox.defaults.headers.common["X-CSRF-TOKEN"] = csrfToken;
+  if (token) {
+    csrfToken = token;
+    roblox.defaults.headers.common["X-CSRF-TOKEN"] = csrfToken;
+  } else {
+    throw new Error("Não consegui obter x-csrf-token");
+  }
 }
 
 async function usernameToUserId(username) {
@@ -146,6 +128,7 @@ async function usernameToUserId(username) {
   return typeof id === "number" ? id : null;
 }
 
+// ✅ Checa se o userId realmente está no grupo antes de tentar exilar (evita 400)
 async function isUserInGroup(userId) {
   const res = await axios.get(`https://groups.roblox.com/v2/users/${userId}/groups/roles`, {
     headers: { Cookie: `.ROBLOSECURITY=${COOKIE}` },
@@ -153,13 +136,17 @@ async function isUserInGroup(userId) {
   });
 
   if (res.status !== 200 || !res.data?.data) return false;
+
   return res.data.data.some(item => item?.group?.id === Number(GROUP_ID));
 }
 
 async function exilarUsuarioPorId(userId) {
+  // garante token
   if (!csrfToken) await refreshCSRF();
 
   let res = await roblox.delete(`https://groups.roblox.com/v1/groups/${GROUP_ID}/users/${userId}`);
+
+  // 403 normalmente é CSRF
   if (res.status === 403) {
     await refreshCSRF();
     res = await roblox.delete(`https://groups.roblox.com/v1/groups/${GROUP_ID}/users/${userId}`);
@@ -193,12 +180,7 @@ async function closeSilently() {
 async function initBrowser() {
   await closeSilently();
 
-  console.log("🌐 Iniciando Firefox...");
-  browser = await firefox.launch({
-    headless: true,
-    args: ["--no-sandbox", "--disable-setuid-sandbox"]
-  });
-
+  browser = await firefox.launch({ headless: true });
   context = await browser.newContext({ viewport: { width: 1280, height: 720 } });
 
   await context.addCookies([{
@@ -212,7 +194,6 @@ async function initBrowser() {
   }]);
 
   page = await context.newPage();
-
   await page.goto("https://www.roblox.com/home", { waitUntil: "domcontentloaded", timeout: 60000 });
   await page.waitForTimeout(1200);
 
@@ -252,7 +233,7 @@ async function ocrAuditToLines() {
 
   const resp = await openai.responses.create({
     model: "gpt-4.1-mini",
-    max_output_tokens: 240,
+    max_output_tokens: 220,
     input: [
       {
         role: "user",
@@ -262,23 +243,12 @@ async function ocrAuditToLines() {
             text:
 `Você está vendo um Audit Log de grupo Roblox.
 
-Na coluna "Usuário" aparece:
-- Em cima: Display Name
-- Em baixo: @username (o username REAL)
-
-Regra OBRIGATÓRIA:
-✅ Sempre use o @username REAL (o de baixo) e retorne SEM o "@".
-
 Extraia SOMENTE eventos de aprovação/recusa de pedidos de entrada.
 Retorne UMA linha por evento no formato:
 
-USERNAME_REAL | ACAO
+ATOR | ACAO
 
 Onde ACAO é apenas: "aceitou" ou "recusou".
-
-Exemplos:
-camillygamer_01 | aceitou
-lalomaio | recusou
 
 Se não houver eventos desse tipo visíveis, responda exatamente:
 SEM ALTERACOES`
@@ -298,9 +268,7 @@ SEM ALTERACOES`
     .filter(Boolean)
     .filter(l => l.includes("|"))
     .map(l => {
-      const [actorRaw, actionRaw] = l.split("|").map(x => x.trim());
-      const actor = normalizeUsernameFromActor(actorRaw);
-      const action = (actionRaw || "").toLowerCase();
+      const [actor, action] = l.split("|").map(x => x.trim());
       return `${actor} | ${action}`;
     });
 }
@@ -350,11 +318,15 @@ async function punishActor(actorUsername) {
     return;
   }
 
+  // ✅ evita 400: só tenta exilar se estiver no grupo
   const inGroup = await isUserInGroup(userId);
   if (!inGroup) {
     if (DEBUG_EXILE) {
-      await sendDiscord(`⚠️ DEBUG: "${actorUsername}" (id ${userId}) não aparece como membro do grupo. Evitei exílio.`);
+      await sendDiscord(
+        `⚠️ DEBUG: tentei exilar "${actorUsername}" (id ${userId}), mas ele NÃO aparece como membro do grupo ${GROUP_ID}. (evitei HTTP 400)`
+      );
     }
+    // não marca punish aqui, pra não “travar” caso o OCR tenha errado uma vez
     return;
   }
 
@@ -365,7 +337,11 @@ async function punishActor(actorUsername) {
   } catch (e) {
     const msg = String(e?.message || e);
     console.error("Erro exilar:", msg);
-    if (DEBUG_EXILE) await sendDiscord(`⚠️ DEBUG EXILE: ${msg}`.slice(0, 1900));
+
+    // manda o body do erro (sem spam) pra você ver exatamente o motivo do 400
+    if (DEBUG_EXILE) {
+      await sendDiscord(`⚠️ DEBUG EXILE: ${msg}`.slice(0, 1900));
+    }
   }
 }
 /* ========================================= */
@@ -397,10 +373,9 @@ async function monitorar() {
 
     for (const l of newLines) {
       const [actorRaw, actionRaw] = l.split("|").map(x => x.trim());
-      const actor = normalizeUsernameFromActor(actorRaw);
+      const actor = actorRaw;
       const action = (actionRaw || "").toLowerCase();
 
-      if (!actor) continue;
       if (action !== "aceitou" && action !== "recusou") continue;
 
       recordEvent(actor);
@@ -409,7 +384,6 @@ async function monitorar() {
         await punishActor(actor);
       }
     }
-
   } catch (err) {
     console.error("Erro no monitor:", err?.message || err);
     try { await closeSilently(); } catch {}
@@ -425,7 +399,10 @@ async function monitorar() {
     process.exit(1);
   }
 
+  // pega CSRF “sem deslogar”
   await refreshCSRF();
+
+  // browser
   await initBrowser();
 
   console.log(`🛡️ Anti Accept/Recuse-all ATIVO | TEST_MODE=${TEST_MODE} | INTERVALO=${INTERVALO}ms`);
