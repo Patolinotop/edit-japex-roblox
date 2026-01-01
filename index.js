@@ -16,10 +16,11 @@ const DISCORD_RESPONSAVEL_ID = "1455692969322614895";
 const INTERVALO = Number(process.env.INTERVALO_MS || "5000");
 const TEST_MODE = String(process.env.TEST_MODE || "1") === "1";
 
+// regras (quando TEST_MODE=0)
 const BURST_WINDOW_MS = 10_000;
 const BURST_THRESHOLD = 3;
 
-const VOLUME_WINDOW_MS = 300_000;
+const VOLUME_WINDOW_MS = 300_000; // 5 min
 const VOLUME_THRESHOLD = 10;
 
 const PUNISH_COOLDOWN_MS = 30 * 60 * 1000;
@@ -68,6 +69,7 @@ Data: ${data}***`
 let running = false;
 let lastImgHash = "";
 let lastEventKeys = new Set();
+
 const actorTimes = new Map();
 const punishedUntil = new Map();
 
@@ -95,7 +97,6 @@ let browser = null;
 let context = null;
 let page = null;
 
-// API request do Playwright (usa cookies do contexto)
 let api = null;
 let csrfToken = null;
 
@@ -135,6 +136,7 @@ async function initBrowser() {
   }
 
   context = await browser.newContext({ viewport: { width: 1280, height: 720 } });
+
   await context.addCookies([{
     name: ".ROBLOSECURITY",
     value: COOKIE,
@@ -151,7 +153,6 @@ async function initBrowser() {
   await page.goto("https://www.roblox.com/home", { waitUntil: "domcontentloaded", timeout: 60000 });
   await page.waitForTimeout(1200);
 
-  // valida auth pelo próprio request (evita mismatch axios vs browser)
   const s = await validarAuth_viaPlaywright();
   if (s !== 200) throw new Error(`Cookie não autenticou (status ${s}). Troque o ROBLOSECURITY.`);
 
@@ -182,12 +183,18 @@ async function capturarAudit() {
 /* ========================================= */
 
 /* ================= OCR ================= */
+/**
+ * Retorna eventos assim:
+ * { actorText: "cami_hudson" OU "cami_hudzinha", action: "aceitou/recusou", when: "..."}
+ *
+ * A ideia é: OCR pode devolver displayName ou username — o resolver abaixo cuida disso.
+ */
 async function ocrAuditEvents() {
   const base64 = fs.readFileSync("audit.png").toString("base64");
 
   const resp = await openai.responses.create({
     model: "gpt-4.1-mini",
-    max_output_tokens: 250,
+    max_output_tokens: 260,
     input: [{
       role: "user",
       content: [
@@ -196,14 +203,20 @@ async function ocrAuditEvents() {
           text:
 `Você está vendo o Audit Log de uma comunidade/grupo Roblox.
 
-Extraia SOMENTE eventos relacionados a pedidos de entrada (aceitou/recusou).
-IMPORTANTE: Se aparecer "DisplayName" e abaixo "@username", use SEMPRE o username (sem @).
+Extraia SOMENTE eventos de pedidos de entrada (aceitou/recusou).
+Pegue APENAS o responsável (ator) — não pegue o usuário que foi aceito/recusado.
+
+O ator pode aparecer como:
+- Display Name grande (ex: "cami_hudson")
+- e abaixo "@username" pequeno (ex: "@cami_hudzinha")
+
+Se o @username estiver visível, use o @username (SEM @).
+Se não estiver, use o Display Name.
 
 Retorne UMA linha por evento no formato:
 
-USERNAME | ACAO | QUANDO
+ATOR | ACAO | QUANDO
 
-- USERNAME: sem @, exemplo: cami_hudzinha
 - ACAO: aceitou ou recusou
 - QUANDO: texto de tempo visível (ou "sem_tempo")
 
@@ -224,34 +237,68 @@ SEM ALTERACOES`
     .filter(Boolean)
     .filter(l => l.includes("|"))
     .map(l => {
-      const [username, action, when] = l.split("|").map(x => x.trim());
-      const u = (username || "").replace(/^@/g, "").trim();
-      return { username: u, action: (action || "").toLowerCase(), when: when || "sem_tempo" };
+      const [actorText, action, when] = l.split("|").map(x => x.trim());
+      const actorClean = (actorText || "").replace(/^@/g, "").trim();
+      return { actorText: actorClean, action: (action || "").toLowerCase(), when: when || "sem_tempo" };
     })
-    .filter(e => e.username && (e.action === "aceitou" || e.action === "recusou"));
+    .filter(e => e.actorText && (e.action === "aceitou" || e.action === "recusou"));
 }
 /* ========================================= */
 
-/* ================= RESOLVE USERID ================= */
-async function usernameToUserId(username) {
-  const res = await api.post("https://users.roblox.com/v1/usernames/users", {
-    data: { usernames: [username], excludeBannedUsers: false }
-  });
-
-  if (!res.ok()) return null;
-
-  const body = await res.json();
-  const id = body?.data?.[0]?.id;
-  return typeof id === "number" ? id : null;
+/* ================= RESOLVE USER ================= */
+function looksLikeUsername(s) {
+  // username roblox geralmente é [A-Za-z0-9_], sem espaços
+  // (não vou travar por tamanho pra não dar falso negativo)
+  return /^[A-Za-z0-9_]+$/.test(s);
 }
 
-async function resolveUserId(usernameSemArroba) {
-  // aqui já é username real (sem @). Se falhar, não tenta displayName.
-  return await usernameToUserId(usernameSemArroba);
+/**
+ * Resolve tanto username quanto displayName.
+ * Retorna { userId, usernameReal } ou null
+ */
+async function resolveUser(actorText) {
+  const query = String(actorText || "").trim().replace(/^@/g, "");
+  if (!query) return null;
+
+  // 1) tenta como username direto
+  if (looksLikeUsername(query)) {
+    const res = await api.post("https://users.roblox.com/v1/usernames/users", {
+      data: { usernames: [query], excludeBannedUsers: false }
+    });
+
+    if (res.ok()) {
+      const body = await res.json();
+      const item = body?.data?.[0];
+      if (item?.id && item?.name) return { userId: item.id, usernameReal: item.name };
+    }
+  }
+
+  // 2) fallback: search por displayName / nome
+  const res2 = await api.get(`https://users.roblox.com/v1/users/search?keyword=${encodeURIComponent(query)}&limit=10`);
+  if (!res2.ok()) return null;
+
+  const body2 = await res2.json();
+  const list = body2?.data || [];
+
+  const lower = query.toLowerCase();
+
+  // match forte: displayName igual
+  const byDisplay = list.find(u => String(u?.displayName || "").toLowerCase() === lower);
+  if (byDisplay?.id && byDisplay?.name) return { userId: byDisplay.id, usernameReal: byDisplay.name };
+
+  // match forte: username igual
+  const byName = list.find(u => String(u?.name || "").toLowerCase() === lower);
+  if (byName?.id && byName?.name) return { userId: byName.id, usernameReal: byName.name };
+
+  // senão pega o primeiro resultado como último fallback
+  const first = list[0];
+  if (first?.id && first?.name) return { userId: first.id, usernameReal: first.name };
+
+  return null;
 }
 /* ========================================= */
 
-/* ================= KICK (via Playwright request) ================= */
+/* ================= KICK ================= */
 async function kickFromGroup(userId) {
   if (!csrfToken) await refreshCSRF_viaPlaywright();
 
@@ -259,7 +306,6 @@ async function kickFromGroup(userId) {
     headers: { "x-csrf-token": csrfToken }
   });
 
-  // se CSRF venceu, renova e tenta 1x
   if (res.status() === 403) {
     await refreshCSRF_viaPlaywright();
     res = await api.delete(`https://groups.roblox.com/v1/groups/${GROUP_ID}/users/${userId}`, {
@@ -268,12 +314,12 @@ async function kickFromGroup(userId) {
   }
 
   if (res.status() === 401) {
-    throw new Error(`Falha ao exilar (HTTP 401) User is not authenticated — cookie expirou ou Roblox derrubou a sessão.`);
+    throw new Error("Falha ao exilar (HTTP 401) User is not authenticated — cookie expirou ou sessão caiu.");
   }
 
   if (res.status() < 200 || res.status() >= 300) {
     let body = "";
-    try { body = JSON.stringify(await res.json()).slice(0, 220); } catch {}
+    try { body = JSON.stringify(await res.json()).slice(0, 240); } catch {}
     throw new Error(`Falha ao exilar (HTTP ${res.status()}) ${body}`);
   }
 }
@@ -312,19 +358,24 @@ function markPunished(actor) {
 /* ========================================= */
 
 /* ================= PUNIÇÃO (Discord só sucesso) ================= */
-async function punishActor(usernameSemArroba) {
-  if (!canPunish(usernameSemArroba)) return;
+async function punishActor(actorText) {
+  if (!canPunish(actorText)) return;
 
   try {
-    const userId = await resolveUserId(usernameSemArroba);
-    if (!userId) throw new Error(`Não consegui resolver userId para username "${usernameSemArroba}".`);
+    const resolved = await resolveUser(actorText);
+    if (!resolved?.userId || !resolved?.usernameReal) {
+      throw new Error(`Não consegui resolver userId/username para "${actorText}" (provável OCR pegou errado).`);
+    }
 
-    await kickFromGroup(userId);
+    await kickFromGroup(resolved.userId);
 
-    await sendDiscord(formatRelatorioExilio(usernameSemArroba));
-    markPunished(usernameSemArroba);
+    // ✅ manda no Discord com username REAL (sem @)
+    await sendDiscord(formatRelatorioExilio(resolved.usernameReal));
+
+    markPunished(actorText);
   } catch (e) {
-    console.error(`⚠️ Falha ao exilar ${usernameSemArroba}:`, String(e?.message || e));
+    // ❌ erros apenas no deploy logs
+    console.error(`⚠️ Falha ao exilar ${actorText}:`, String(e?.message || e));
   }
 }
 /* ========================================= */
@@ -349,7 +400,7 @@ async function monitorar() {
 
     // baseline: primeira leitura não pune
     if (!baselineReady) {
-      lastEventKeys = new Set(events.map(e => `${e.username}|${e.action}|${e.when}`));
+      lastEventKeys = new Set(events.map(e => `${e.actorText}|${e.action}|${e.when}`));
       baselineReady = true;
       console.log("✅ Baseline setado. A partir da próxima mudança o bot começa a agir.");
       return;
@@ -357,19 +408,19 @@ async function monitorar() {
 
     if (!events.length) return;
 
-    const currentKeys = new Set(events.map(e => `${e.username}|${e.action}|${e.when}`));
+    const currentKeys = new Set(events.map(e => `${e.actorText}|${e.action}|${e.when}`));
     const newKeys = [...currentKeys].filter(k => !lastEventKeys.has(k));
     lastEventKeys = currentKeys;
 
     if (!newKeys.length) return;
 
     for (const k of newKeys) {
-      const [username] = k.split("|").map(x => x.trim());
+      const [actorText] = k.split("|").map(x => x.trim());
 
-      recordActor(username);
+      recordActor(actorText);
 
-      if (shouldPunish(username)) {
-        await punishActor(username);
+      if (shouldPunish(actorText)) {
+        await punishActor(actorText);
       }
     }
   } catch (err) {
@@ -390,7 +441,7 @@ process.on("uncaughtException", (err) => console.error("UncaughtException:", err
   console.log(`🛡️ Rodando | TEST_MODE=${TEST_MODE} | INTERVALO=${INTERVALO}ms`);
   console.log("ℹ️ Primeira captura = baseline (não pune ninguém).");
 
-  // seta baseline logo no começo
+  // seta baseline imediatamente
   await monitorar();
 
   setInterval(monitorar, INTERVALO);
