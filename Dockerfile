@@ -5,7 +5,7 @@ WORKDIR /app
 COPY package.json package-lock.json* ./
 RUN npm install
 
-# garante que o Firefox certo existe dentro da imagem
+# garante Firefox compatível com a versão do Playwright instalada
 RUN npx playwright install firefox
 
 COPY . .
