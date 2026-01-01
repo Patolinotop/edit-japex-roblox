@@ -13,11 +13,11 @@ const OPENAI_KEY = process.env.OPENAI_API_KEY;
 
 const DISCORD_RESPONSAVEL_ID = "1455692969322614895";
 
-const INTERVALO = Number(process.env.INTERVALO_MS || "300"); // produção: 5 min
+const INTERVALO = Number(process.env.INTERVALO_MS || "300000"); // produção: 5 min
 const TEST_MODE = String(process.env.TEST_MODE || "0") === "1"; // ✅ padrão OFF
 
 // ✅ regra nova: 3+ ações no MESMO minuto => exílio
-const SAME_MINUTE_THRESHOLD = Number(process.env.SAME_MINUTE_THRESHOLD || "1");
+const SAME_MINUTE_THRESHOLD = Number(process.env.SAME_MINUTE_THRESHOLD || "3");
 
 // (extra anti-bypass opcional) volume em 5 min
 const VOLUME_WINDOW_MS = 300_000;
