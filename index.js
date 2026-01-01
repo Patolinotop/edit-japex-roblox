@@ -43,93 +43,19 @@ if (COOKIE.startsWith(".ROBLOSECURITY=")) {
 
 const openai = new OpenAI({ apiKey: OPENAI_KEY });
 
-/* ================= ROBLOX CLIENT (KICK) ================= */
-let csrfToken = null;
-const roblox = axios.create({
-  headers: {
-    Cookie: `.ROBLOSECURITY=${COOKIE}`,
-    "Content-Type": "application/json",
-    "User-Agent": "Mozilla/5.0"
-  },
-  validateStatus: () => true
-});
-
-async function refreshCSRF() {
-  const res = await roblox.post("https://auth.roblox.com/v2/logout");
-  csrfToken = res.headers["x-csrf-token"];
-  if (csrfToken) roblox.defaults.headers["X-CSRF-TOKEN"] = csrfToken;
-}
-
-async function validarCookieHTTP() {
-  const res = await axios.get("https://users.roblox.com/v1/users/authenticated", {
-    headers: { Cookie: `.ROBLOSECURITY=${COOKIE}` },
-    validateStatus: () => true
-  });
-  return res.status === 200 ? res.data : null;
-}
-
-/* ====== resolver userId (username + fallback search) ====== */
-async function usernameToUserId(username) {
-  const res = await axios.post(
-    "https://users.roblox.com/v1/usernames/users",
-    { usernames: [username], excludeBannedUsers: false },
-    { headers: { Cookie: `.ROBLOSECURITY=${COOKIE}` }, validateStatus: () => true }
-  );
-  const id = res?.data?.data?.[0]?.id;
-  return typeof id === "number" ? id : null;
-}
-
-async function searchNameToUserId(name) {
-  const res = await axios.get(
-    `https://users.roblox.com/v1/users/search?keyword=${encodeURIComponent(name)}&limit=10`,
-    { headers: { Cookie: `.ROBLOSECURITY=${COOKIE}` }, validateStatus: () => true }
-  );
-  const data = res?.data?.data || [];
-  const lower = String(name).toLowerCase();
-
-  const exact = data.find(u =>
-    String(u?.name || "").toLowerCase() === lower ||
-    String(u?.displayName || "").toLowerCase() === lower
-  );
-  if (exact?.id) return exact.id;
-
-  return data?.[0]?.id ?? null;
-}
-
-async function resolveUserId(actorText) {
-  return (await usernameToUserId(actorText)) || (await searchNameToUserId(actorText));
-}
-
-async function kickFromGroup(userId) {
-  if (!csrfToken) await refreshCSRF();
-
-  let res = await roblox.delete(`https://groups.roblox.com/v1/groups/${GROUP_ID}/users/${userId}`);
-
-  if (res.status === 403 || res.status === 400) {
-    await refreshCSRF();
-    res = await roblox.delete(`https://groups.roblox.com/v1/groups/${GROUP_ID}/users/${userId}`);
-  }
-
-  if (res.status < 200 || res.status >= 300) {
-    const body = typeof res.data === "string" ? res.data : JSON.stringify(res.data);
-    throw new Error(`Falha ao exilar (HTTP ${res.status}) ${body?.slice(0, 200) || ""}`);
-  }
-}
-/* ========================================= */
-
 /* ================= DISCORD (SÓ SUCESSO) ================= */
 async function sendDiscord(content) {
   await axios.post(WEBHOOK, { content });
 }
 
-function formatRelatorioExilio(exilado) {
+function formatRelatorioExilio(usernameSemArroba) {
   const data = new Date().toLocaleDateString("pt-BR");
   return (
 `***Relatório de Exílio!
 
 Responsável: <@${DISCORD_RESPONSAVEL_ID}>
 
-Exilado(a): ${exilado}
+Exilado(a): ${usernameSemArroba}
 
 Motivo: Aceppt-all
 
@@ -145,7 +71,7 @@ let lastEventKeys = new Set();
 const actorTimes = new Map();
 const punishedUntil = new Map();
 
-// ✅ baseline: na primeira leitura, aprende e não pune
+// baseline: primeira leitura não pune
 let baselineReady = false;
 /* ========================================= */
 
@@ -169,11 +95,27 @@ let browser = null;
 let context = null;
 let page = null;
 
+// API request do Playwright (usa cookies do contexto)
+let api = null;
+let csrfToken = null;
+
 async function closeSilently() {
   try { if (page && !page.isClosed()) await page.close(); } catch {}
   try { if (context) await context.close(); } catch {}
   try { if (browser) await browser.close(); } catch {}
-  page = null; context = null; browser = null;
+  page = null; context = null; browser = null; api = null; csrfToken = null;
+}
+
+async function refreshCSRF_viaPlaywright() {
+  const res = await api.post("https://auth.roblox.com/v2/logout");
+  const token = res.headers()["x-csrf-token"];
+  if (!token) throw new Error("Não consegui obter X-CSRF-TOKEN.");
+  csrfToken = token;
+}
+
+async function validarAuth_viaPlaywright() {
+  const res = await api.get("https://users.roblox.com/v1/users/authenticated");
+  return res.status();
 }
 
 async function initBrowser() {
@@ -193,7 +135,6 @@ async function initBrowser() {
   }
 
   context = await browser.newContext({ viewport: { width: 1280, height: 720 } });
-
   await context.addCookies([{
     name: ".ROBLOSECURITY",
     value: COOKIE,
@@ -204,17 +145,17 @@ async function initBrowser() {
     sameSite: "None"
   }]);
 
+  api = context.request;
   page = await context.newPage();
 
   await page.goto("https://www.roblox.com/home", { waitUntil: "domcontentloaded", timeout: 60000 });
   await page.waitForTimeout(1200);
 
-  const status = await page.evaluate(async () => {
-    const r = await fetch("https://users.roblox.com/v1/users/authenticated", { credentials: "include" });
-    return r.status;
-  });
+  // valida auth pelo próprio request (evita mismatch axios vs browser)
+  const s = await validarAuth_viaPlaywright();
+  if (s !== 200) throw new Error(`Cookie não autenticou (status ${s}). Troque o ROBLOSECURITY.`);
 
-  if (status !== 200) throw new Error("Cookie não logou no navegador (inválido/expirado/sem permissão).");
+  await refreshCSRF_viaPlaywright();
 
   await page.goto(AUDIT_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
   await page.waitForTimeout(1200);
@@ -253,15 +194,21 @@ async function ocrAuditEvents() {
         {
           type: "input_text",
           text:
-`Extraia SOMENTE eventos de aprovação/recusa de pedidos de entrada do Audit Log Roblox.
+`Você está vendo o Audit Log de uma comunidade/grupo Roblox.
+
+Extraia SOMENTE eventos relacionados a pedidos de entrada (aceitou/recusou).
+IMPORTANTE: Se aparecer "DisplayName" e abaixo "@username", use SEMPRE o username (sem @).
+
 Retorne UMA linha por evento no formato:
 
-ATOR | ACAO | QUANDO
+USERNAME | ACAO | QUANDO
 
+- USERNAME: sem @, exemplo: cami_hudzinha
 - ACAO: aceitou ou recusou
 - QUANDO: texto de tempo visível (ou "sem_tempo")
 
-Se não houver, responda: SEM ALTERACOES`
+Se não houver eventos desse tipo visíveis, responda exatamente:
+SEM ALTERACOES`
         },
         { type: "input_image", image_url: `data:image/png;base64,${base64}` }
       ]
@@ -277,10 +224,58 @@ Se não houver, responda: SEM ALTERACOES`
     .filter(Boolean)
     .filter(l => l.includes("|"))
     .map(l => {
-      const [actor, action, when] = l.split("|").map(x => x.trim());
-      return { actor, action: (action || "").toLowerCase(), when: when || "sem_tempo" };
+      const [username, action, when] = l.split("|").map(x => x.trim());
+      const u = (username || "").replace(/^@/g, "").trim();
+      return { username: u, action: (action || "").toLowerCase(), when: when || "sem_tempo" };
     })
-    .filter(e => e.actor && (e.action === "aceitou" || e.action === "recusou"));
+    .filter(e => e.username && (e.action === "aceitou" || e.action === "recusou"));
+}
+/* ========================================= */
+
+/* ================= RESOLVE USERID ================= */
+async function usernameToUserId(username) {
+  const res = await api.post("https://users.roblox.com/v1/usernames/users", {
+    data: { usernames: [username], excludeBannedUsers: false }
+  });
+
+  if (!res.ok()) return null;
+
+  const body = await res.json();
+  const id = body?.data?.[0]?.id;
+  return typeof id === "number" ? id : null;
+}
+
+async function resolveUserId(usernameSemArroba) {
+  // aqui já é username real (sem @). Se falhar, não tenta displayName.
+  return await usernameToUserId(usernameSemArroba);
+}
+/* ========================================= */
+
+/* ================= KICK (via Playwright request) ================= */
+async function kickFromGroup(userId) {
+  if (!csrfToken) await refreshCSRF_viaPlaywright();
+
+  let res = await api.delete(`https://groups.roblox.com/v1/groups/${GROUP_ID}/users/${userId}`, {
+    headers: { "x-csrf-token": csrfToken }
+  });
+
+  // se CSRF venceu, renova e tenta 1x
+  if (res.status() === 403) {
+    await refreshCSRF_viaPlaywright();
+    res = await api.delete(`https://groups.roblox.com/v1/groups/${GROUP_ID}/users/${userId}`, {
+      headers: { "x-csrf-token": csrfToken }
+    });
+  }
+
+  if (res.status() === 401) {
+    throw new Error(`Falha ao exilar (HTTP 401) User is not authenticated — cookie expirou ou Roblox derrubou a sessão.`);
+  }
+
+  if (res.status() < 200 || res.status() >= 300) {
+    let body = "";
+    try { body = JSON.stringify(await res.json()).slice(0, 220); } catch {}
+    throw new Error(`Falha ao exilar (HTTP ${res.status()}) ${body}`);
+  }
 }
 /* ========================================= */
 
@@ -316,22 +311,20 @@ function markPunished(actor) {
 }
 /* ========================================= */
 
-/* ================= PUNIÇÃO ================= */
-async function punishActor(actor) {
-  if (!canPunish(actor)) return;
+/* ================= PUNIÇÃO (Discord só sucesso) ================= */
+async function punishActor(usernameSemArroba) {
+  if (!canPunish(usernameSemArroba)) return;
 
   try {
-    const userId = await resolveUserId(actor);
-    if (!userId) throw new Error("Não consegui resolver userId (username/displayName).");
+    const userId = await resolveUserId(usernameSemArroba);
+    if (!userId) throw new Error(`Não consegui resolver userId para username "${usernameSemArroba}".`);
 
     await kickFromGroup(userId);
 
-    // ✅ só manda relatório se kick deu certo
-    await sendDiscord(formatRelatorioExilio(actor));
-
-    markPunished(actor);
+    await sendDiscord(formatRelatorioExilio(usernameSemArroba));
+    markPunished(usernameSemArroba);
   } catch (e) {
-    console.error(`⚠️ Falha ao exilar ${actor}:`, String(e?.message || e));
+    console.error(`⚠️ Falha ao exilar ${usernameSemArroba}:`, String(e?.message || e));
   }
 }
 /* ========================================= */
@@ -354,10 +347,9 @@ async function monitorar() {
     const events = await ocrAuditEvents();
     try { fs.unlinkSync("audit.png"); } catch {}
 
-    // ✅ primeira leitura após start: baseline (não pune)
+    // baseline: primeira leitura não pune
     if (!baselineReady) {
-      const keys = new Set(events.map(e => `${e.actor}|${e.action}|${e.when}`));
-      lastEventKeys = keys;
+      lastEventKeys = new Set(events.map(e => `${e.username}|${e.action}|${e.when}`));
       baselineReady = true;
       console.log("✅ Baseline setado. A partir da próxima mudança o bot começa a agir.");
       return;
@@ -365,18 +357,19 @@ async function monitorar() {
 
     if (!events.length) return;
 
-    const currentKeys = new Set(events.map(e => `${e.actor}|${e.action}|${e.when}`));
+    const currentKeys = new Set(events.map(e => `${e.username}|${e.action}|${e.when}`));
     const newKeys = [...currentKeys].filter(k => !lastEventKeys.has(k));
     lastEventKeys = currentKeys;
 
     if (!newKeys.length) return;
 
     for (const k of newKeys) {
-      const [actor] = k.split("|").map(x => x.trim());
-      recordActor(actor);
+      const [username] = k.split("|").map(x => x.trim());
 
-      if (shouldPunish(actor)) {
-        await punishActor(actor);
+      recordActor(username);
+
+      if (shouldPunish(username)) {
+        await punishActor(username);
       }
     }
   } catch (err) {
@@ -392,19 +385,13 @@ process.on("uncaughtException", (err) => console.error("UncaughtException:", err
 
 /* ================= START ================= */
 (async () => {
-  const me = await validarCookieHTTP();
-  if (!me) {
-    console.error("❌ ROBLOSECURITY inválido/expirado. Corrija e redeploy.");
-    process.exit(1);
-  }
-
-  await refreshCSRF();
   await initBrowser();
 
   console.log(`🛡️ Rodando | TEST_MODE=${TEST_MODE} | INTERVALO=${INTERVALO}ms`);
   console.log("ℹ️ Primeira captura = baseline (não pune ninguém).");
-  setInterval(monitorar, INTERVALO);
 
-  // opcional: roda uma vez logo ao iniciar pra setar baseline mais rápido
+  // seta baseline logo no começo
   await monitorar();
+
+  setInterval(monitorar, INTERVALO);
 })();
