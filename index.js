@@ -16,7 +16,6 @@ const DISCORD_RESPONSAVEL_ID = "1455692969322614895";
 const INTERVALO = Number(process.env.INTERVALO_MS || "5000");
 const TEST_MODE = String(process.env.TEST_MODE || "1") === "1";
 
-// produção sugerida quando TEST_MODE=0
 const BURST_WINDOW_MS = 10_000;
 const BURST_THRESHOLD = 3;
 
@@ -24,9 +23,6 @@ const VOLUME_WINDOW_MS = 300_000; // 5 min
 const VOLUME_THRESHOLD = 10;
 
 const PUNISH_COOLDOWN_MS = 30 * 60 * 1000;
-
-// evita punir 50x o mesmo cara por OCR variar
-const RECENT_PUNISH_TTL_MS = 60 * 60 * 1000; // 1h
 
 const AUDIT_URL = `https://www.roblox.com/groups/configure?id=${GROUP_ID}#!/auditLog`;
 /* ========================================= */
@@ -36,7 +32,7 @@ if (!GROUP_ID || !COOKIE || !WEBHOOK || !OPENAI_KEY) {
   process.exit(1);
 }
 
-// sanitiza cookie (NÃO cole aqui publicamente)
+// sanitiza cookie
 COOKIE = COOKIE.trim();
 if ((COOKIE.startsWith('"') && COOKIE.endsWith('"')) || (COOKIE.startsWith("'") && COOKIE.endsWith("'"))) {
   COOKIE = COOKIE.slice(1, -1).trim();
@@ -52,14 +48,14 @@ async function sendDiscord(content) {
   await axios.post(WEBHOOK, { content });
 }
 
-function formatRelatorioExilio(exiladoSemArroba) {
+function formatRelatorioExilio(usernameSemArroba) {
   const data = new Date().toLocaleDateString("pt-BR");
   return (
 `***Relatório de Exílio!
 
 Responsável: <@${DISCORD_RESPONSAVEL_ID}>
 
-Exilado(a): ${exiladoSemArroba}
+Exilado(a): ${usernameSemArroba}
 
 Motivo: Aceppt-all
 
@@ -72,11 +68,9 @@ Data: ${data}***`
 let running = false;
 let lastImgHash = "";
 let lastEventKeys = new Set();
+const actorTimes = new Map();
+const punishedUntil = new Map();
 let baselineReady = false;
-
-const actorTimes = new Map();       // actorName -> [timestamps]
-const punishedUntil = new Map();    // actorName -> cooldownUntil
-const punishedRecently = new Map(); // canonicalName -> timestamp (anti spam)
 /* ========================================= */
 
 /* ================= PLAYWRIGHT FALLBACK ================= */
@@ -184,12 +178,10 @@ async function capturarAudit() {
 /* ========================================= */
 
 /* ================= OCR ================= */
-function cleanName(s) {
-  return String(s || "")
-    .trim()
-    .replace(/^@+/, "")
-    .replace(/\s+/g, " ")
-    .trim();
+function isLikelyUsername(s) {
+  // username Roblox: letras/números/_ (sem espaços), 3-20 chars (geralmente)
+  const t = String(s || "").trim().replace(/^@/, "");
+  return /^[a-zA-Z0-9_]{3,20}$/.test(t);
 }
 
 async function ocrAuditEvents() {
@@ -197,7 +189,7 @@ async function ocrAuditEvents() {
 
   const resp = await openai.responses.create({
     model: "gpt-4.1-mini",
-    max_output_tokens: 320,
+    max_output_tokens: 280,
     input: [{
       role: "user",
       content: [
@@ -206,21 +198,19 @@ async function ocrAuditEvents() {
           text:
 `Você está vendo o Audit Log de um grupo/comunidade Roblox.
 
-Extraia SOMENTE ações de pedidos de entrada (aceitou/recusou).
-Quero o RESPONSÁVEL (quem fez a ação), NÃO quem foi aceito/recusado.
-
+Extraia SOMENTE eventos de pedidos de entrada (aceitou/recusou).
 IMPORTANTE:
-- Se aparecer Display Name grande e abaixo "@username", use o @username.
-- Retorne o nome SEM "@". (ex: cami_hudzinha)
-- Se não houver @username visível, retorne o nome que aparecer mesmo.
+- Se aparecer Display Name grande e abaixo "@username", use SEMPRE o @username.
+- Retorne o USERNAME sem o "@". (ex: cami_hudzinha)
+- Se NÃO aparecer @username na linha, retorne o Display Name mesmo assim (ex: "Cami Hudson") para eu tentar resolver depois.
 
 Formato (1 linha por evento):
-RESPONSAVEL | ACAO | QUANDO
+NOME | ACAO | QUANDO
 
 - ACAO: aceitou ou recusou
-- QUANDO: texto de tempo visível (ou "sem_tempo")
+- QUANDO: tempo visível (ou "sem_tempo")
 
-Se não houver alterações visíveis, responda exatamente:
+Se não houver eventos desse tipo, responda exatamente:
 SEM ALTERACOES`
         },
         { type: "input_image", image_url: `data:image/png;base64,${base64}` }
@@ -237,97 +227,64 @@ SEM ALTERACOES`
     .filter(Boolean)
     .filter(l => l.includes("|"))
     .map(l => {
-      const [whoRaw, actionRaw, whenRaw] = l.split("|").map(x => x.trim());
-      const who = cleanName(whoRaw);
+      const [nameRaw, actionRaw, whenRaw] = l.split("|").map(x => x.trim());
+      const name = (nameRaw || "").replace(/^@/g, "").trim();
       const action = (actionRaw || "").toLowerCase();
       const when = whenRaw || "sem_tempo";
-      return { who, action, when };
+      return { name, action, when };
     })
-    .filter(e => e.who && (e.action === "aceitou" || e.action === "recusou"));
+    .filter(e => e.name && (e.action === "aceitou" || e.action === "recusou"));
 }
 /* ========================================= */
 
-/* ================= USER RESOLVE (public + fuzzy) ================= */
-// Username “puro” costuma ser assim (Roblox):
-function looksLikeUsername(s) {
-  const t = cleanName(s);
-  return /^[a-zA-Z0-9_]{3,20}$/.test(t);
+/* ================= RESOLVE USER ================= */
+async function usernameToUserId(username) {
+  const res = await api.post("https://users.roblox.com/v1/usernames/users", {
+    data: { usernames: [username], excludeBannedUsers: false }
+  });
+  if (!res.ok()) return null;
+  const body = await res.json();
+  const id = body?.data?.[0]?.id;
+  return typeof id === "number" ? id : null;
 }
 
-function levenshtein(a, b) {
-  a = String(a || "");
-  b = String(b || "");
-  const m = a.length, n = b.length;
-  const dp = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
-  for (let i = 0; i <= m; i++) dp[i][0] = i;
-  for (let j = 0; j <= n; j++) dp[0][j] = j;
-  for (let i = 1; i <= m; i++) {
-    for (let j = 1; j <= n; j++) {
-      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
-      dp[i][j] = Math.min(
-        dp[i - 1][j] + 1,
-        dp[i][j - 1] + 1,
-        dp[i - 1][j - 1] + cost
-      );
-    }
-  }
-  return dp[m][n];
+async function resolveByDisplayName(displayName) {
+  // busca e tenta match por displayName
+  const res = await api.get(
+    `https://users.roblox.com/v1/users/search?keyword=${encodeURIComponent(displayName)}&limit=10`
+  );
+  if (!res.ok()) return null;
+
+  const body = await res.json();
+  const list = body?.data || [];
+  const lower = String(displayName).toLowerCase();
+
+  const exact = list.find(u => String(u?.displayName || "").toLowerCase() === lower);
+  const pick = exact || list[0];
+  if (!pick?.id) return null;
+
+  // aqui dá pra pegar username real
+  return { userId: pick.id, username: pick.name || null };
 }
 
-async function resolveUserIdPublic(nameFromOCR) {
-  const name = cleanName(nameFromOCR);
-  if (!name) return null;
+async function resolveUser(nameFromOCR) {
+  // retorna { userId, usernameForReport }
+  const n = String(nameFromOCR || "").trim();
 
-  // 1) tenta como username (endpoint público, sem cookie)
-  if (looksLikeUsername(name)) {
-    try {
-      const r = await axios.post(
-        "https://users.roblox.com/v1/usernames/users",
-        { usernames: [name], excludeBannedUsers: false },
-        { validateStatus: () => true }
-      );
-
-      const id = r?.data?.data?.[0]?.id;
-      if (typeof id === "number") return { userId: id, usernameForReport: name };
-    } catch {}
+  if (isLikelyUsername(n)) {
+    const userId = await usernameToUserId(n);
+    if (!userId) return null;
+    return { userId, usernameForReport: n };
   }
 
-  // 2) fallback: search público por keyword (pega username real e faz fuzzy)
-  try {
-    const r = await axios.get(
-      `https://users.roblox.com/v1/users/search?keyword=${encodeURIComponent(name)}&limit=10`,
-      { validateStatus: () => true }
-    );
+  // fallback: display name -> search -> pega username real
+  const byDisp = await resolveByDisplayName(n);
+  if (!byDisp?.userId) return null;
 
-    const list = r?.data?.data || [];
-    if (!Array.isArray(list) || list.length === 0) return null;
-
-    // escolha melhor match comparando com username e displayName
-    const target = name.toLowerCase();
-    let best = null;
-    let bestScore = Number.POSITIVE_INFINITY;
-
-    for (const u of list) {
-      const uname = String(u?.name || "");
-      const dname = String(u?.displayName || "");
-
-      const s1 = levenshtein(target, uname.toLowerCase());
-      const s2 = levenshtein(target, dname.toLowerCase());
-      const s = Math.min(s1, s2);
-
-      if (s < bestScore) {
-        bestScore = s;
-        best = u;
-      }
-    }
-
-    if (best?.id) {
-      const username = String(best.name || "").trim() || name;
-      return { userId: best.id, usernameForReport: cleanName(username) };
-    }
-  } catch {}
-
-  return null;
+  return {
+    userId: byDisp.userId,
+    usernameForReport: (byDisp.username || n).replace(/^@/, "")
+  };
 }
 /* ========================================= */
 
@@ -339,6 +296,7 @@ async function kickFromGroup(userId) {
     headers: { "x-csrf-token": csrfToken }
   });
 
+  // CSRF renew
   if (res.status() === 403) {
     await refreshCSRF();
     res = await api.delete(`https://groups.roblox.com/v1/groups/${GROUP_ID}/users/${userId}`, {
@@ -346,8 +304,9 @@ async function kickFromGroup(userId) {
     });
   }
 
+  // auth caiu
   if (res.status() === 401) {
-    throw new Error("HTTP 401 — cookie expirou/foi invalidado.");
+    throw new Error(`HTTP 401 (User is not authenticated) — cookie expirou/foi invalidado.`);
   }
 
   if (res.status() < 200 || res.status() >= 300) {
@@ -388,66 +347,41 @@ function canPunish(actor) {
 function markPunished(actor) {
   punishedUntil.set(actor, now() + PUNISH_COOLDOWN_MS);
 }
-
-function cleanupRecentPunish() {
-  const t = now();
-  for (const [k, ts] of punishedRecently.entries()) {
-    if (t - ts > RECENT_PUNISH_TTL_MS) punishedRecently.delete(k);
-  }
-}
-
-function alreadyPunishedRecently(key) {
-  cleanupRecentPunish();
-  return punishedRecently.has(key);
-}
-
-function markPunishedRecently(key) {
-  punishedRecently.set(key, now());
-}
 /* ========================================= */
 
 /* ================= PUNIÇÃO ================= */
 async function punishActor(nameFromOCR) {
-  const raw = cleanName(nameFromOCR);
-  if (!raw) return;
+  if (!canPunish(nameFromOCR)) return;
 
-  // não repetir punir por OCR variar
-  if (alreadyPunishedRecently(raw)) return;
-
-  if (!canPunish(raw)) return;
-
-  // resolve userId (com fuzzy)
-  const resolved = await resolveUserIdPublic(raw);
+  // resolve primeiro
+  const resolved = await resolveUser(nameFromOCR);
   if (!resolved) {
-    console.error(`⚠️ Falha ao exilar ${raw}: Não consegui resolver userId (provável display/typo).`);
-    // evita spam infinito
-    markPunished(raw);
-    markPunishedRecently(raw);
+    console.error(`⚠️ Não consegui resolver usuário a partir de "${nameFromOCR}" (display/username).`);
+    // evita spam infinito nesse cara “não resolvido”
+    markPunished(nameFromOCR);
     return;
   }
 
   const { userId, usernameForReport } = resolved;
 
-  // 1) kick
+  // 1) tenta kick
   try {
     await kickFromGroup(userId);
     console.log(`✅ Kick OK: ${usernameForReport} (id=${userId})`);
   } catch (e) {
-    console.error(`⚠️ Falha ao exilar ${usernameForReport}:`, String(e?.message || e));
-    // evita loop infinito
-    markPunished(raw);
-    markPunishedRecently(raw);
+    console.error(`⚠️ Falha no kick de ${usernameForReport} (id=${userId}):`, String(e?.message || e));
+    // evita loop infinito tentando de novo toda hora
+    markPunished(nameFromOCR);
     return;
   }
 
-  // 2) marca punido (mesmo se discord falhar)
-  markPunished(raw);
-  markPunishedRecently(raw);
+  // 2) marca punido MESMO se Discord falhar
+  markPunished(nameFromOCR);
 
-  // 3) discord (se falhar: só log)
+  // 3) tenta mandar relatório (se falhar, só loga)
   try {
     await sendDiscord(formatRelatorioExilio(usernameForReport));
-    console.log(`📣 Relatório enviado: ${usernameForReport}`);
+    console.log(`📣 Relatório enviado no Discord: ${usernameForReport}`);
   } catch (e) {
     console.error(`⚠️ Discord falhou ao enviar relatório (${usernameForReport}):`, String(e?.message || e));
   }
@@ -474,7 +408,7 @@ async function monitorar() {
 
     // baseline (primeira leitura)
     if (!baselineReady) {
-      lastEventKeys = new Set(events.map(e => `${e.who}|${e.action}|${e.when}`));
+      lastEventKeys = new Set(events.map(e => `${e.name}|${e.action}|${e.when}`));
       baselineReady = true;
       console.log("✅ Baseline setado. Próximas mudanças serão avaliadas.");
       return;
@@ -482,19 +416,19 @@ async function monitorar() {
 
     if (!events.length) return;
 
-    const currentKeys = new Set(events.map(e => `${e.who}|${e.action}|${e.when}`));
+    const currentKeys = new Set(events.map(e => `${e.name}|${e.action}|${e.when}`));
     const newKeys = [...currentKeys].filter(k => !lastEventKeys.has(k));
     lastEventKeys = currentKeys;
 
     if (!newKeys.length) return;
 
     for (const k of newKeys) {
-      const [who] = k.split("|").map(x => x.trim());
+      const [name] = k.split("|").map(x => x.trim());
 
-      recordActor(who);
+      recordActor(name);
 
-      if (shouldPunish(who)) {
-        await punishActor(who);
+      if (shouldPunish(name)) {
+        await punishActor(name);
       }
     }
   } catch (err) {
