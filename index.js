@@ -16,11 +16,10 @@ const DISCORD_RESPONSAVEL_ID = "1455692969322614895";
 const INTERVALO = Number(process.env.INTERVALO_MS || "5000");
 const TEST_MODE = String(process.env.TEST_MODE || "1") === "1";
 
-// regras (quando TEST_MODE=0)
 const BURST_WINDOW_MS = 10_000;
 const BURST_THRESHOLD = 3;
 
-const VOLUME_WINDOW_MS = 300_000; // 5 min
+const VOLUME_WINDOW_MS = 300_000;
 const VOLUME_THRESHOLD = 10;
 
 const PUNISH_COOLDOWN_MS = 30 * 60 * 1000;
@@ -29,11 +28,11 @@ const AUDIT_URL = `https://www.roblox.com/groups/configure?id=${GROUP_ID}#!/audi
 /* ========================================= */
 
 if (!GROUP_ID || !COOKIE || !WEBHOOK || !OPENAI_KEY) {
-  console.error("❌ Faltando env: GROUP_ID / ROBLOSECURITY / DISCORD_WEBHOOK / OPENAI_API_KEY");
+  console.error("❌ Faltando env obrigatórias.");
   process.exit(1);
 }
 
-// sanitiza cookie
+/* ================= COOKIE ================= */
 COOKIE = COOKIE.trim();
 if ((COOKIE.startsWith('"') && COOKIE.endsWith('"')) || (COOKIE.startsWith("'") && COOKIE.endsWith("'"))) {
   COOKIE = COOKIE.slice(1, -1).trim();
@@ -41,22 +40,23 @@ if ((COOKIE.startsWith('"') && COOKIE.endsWith('"')) || (COOKIE.startsWith("'") 
 if (COOKIE.startsWith(".ROBLOSECURITY=")) {
   COOKIE = COOKIE.replace(".ROBLOSECURITY=", "").trim();
 }
+/* ========================================= */
 
 const openai = new OpenAI({ apiKey: OPENAI_KEY });
 
-/* ================= DISCORD (SÓ SUCESSO) ================= */
+/* ================= DISCORD ================= */
 async function sendDiscord(content) {
   await axios.post(WEBHOOK, { content });
 }
 
-function formatRelatorioExilio(usernameSemArroba) {
+function formatRelatorioExilio(username) {
   const data = new Date().toLocaleDateString("pt-BR");
   return (
 `***Relatório de Exílio!
 
 Responsável: <@${DISCORD_RESPONSAVEL_ID}>
 
-Exilado(a): ${usernameSemArroba}
+Exilado(a): ${username}
 
 Motivo: Aceppt-all
 
@@ -69,74 +69,33 @@ Data: ${data}***`
 let running = false;
 let lastImgHash = "";
 let lastEventKeys = new Set();
+let baselineReady = false;
 
 const actorTimes = new Map();
 const punishedUntil = new Map();
-
-// baseline: primeira leitura não pune
-let baselineReady = false;
-/* ========================================= */
-
-/* ================= PLAYWRIGHT RUNTIME FALLBACK ================= */
-function ensurePlaywrightBrowsersInstalled() {
-  try {
-    console.log("🔧 Verificando/instalando browsers do Playwright...");
-    execSync("npx playwright --version", { stdio: "inherit" });
-    execSync("npx playwright install firefox", { stdio: "inherit" });
-    console.log("✅ Browser Firefox pronto.");
-  } catch (e) {
-    console.error("❌ Falha ao instalar browsers via npx playwright install firefox.");
-    console.error(String(e?.message || e));
-    process.exit(1);
-  }
-}
 /* ========================================= */
 
 /* ================= PLAYWRIGHT ================= */
-let browser = null;
-let context = null;
-let page = null;
+let browser, context, page, api, csrfToken;
 
-let api = null;
-let csrfToken = null;
-
-async function closeSilently() {
-  try { if (page && !page.isClosed()) await page.close(); } catch {}
-  try { if (context) await context.close(); } catch {}
-  try { if (browser) await browser.close(); } catch {}
-  page = null; context = null; browser = null; api = null; csrfToken = null;
-}
-
-async function refreshCSRF_viaPlaywright() {
-  const res = await api.post("https://auth.roblox.com/v2/logout");
-  const token = res.headers()["x-csrf-token"];
-  if (!token) throw new Error("Não consegui obter X-CSRF-TOKEN.");
-  csrfToken = token;
-}
-
-async function validarAuth_viaPlaywright() {
-  const res = await api.get("https://users.roblox.com/v1/users/authenticated");
-  return res.status();
+function ensureBrowsers() {
+  try {
+    execSync("npx playwright install firefox", { stdio: "inherit" });
+  } catch {
+    console.error("❌ Falha ao instalar Firefox.");
+    process.exit(1);
+  }
 }
 
 async function initBrowser() {
-  await closeSilently();
-
   try {
     browser = await firefox.launch({ headless: true });
-  } catch (e) {
-    const msg = String(e?.message || e);
-    if (msg.includes("Executable doesn't exist")) {
-      console.error("⚠️ Firefox não encontrado. Instalando em runtime...");
-      ensurePlaywrightBrowsersInstalled();
-      browser = await firefox.launch({ headless: true });
-    } else {
-      throw e;
-    }
+  } catch {
+    ensureBrowsers();
+    browser = await firefox.launch({ headless: true });
   }
 
-  context = await browser.newContext({ viewport: { width: 1280, height: 720 } });
-
+  context = await browser.newContext();
   await context.addCookies([{
     name: ".ROBLOSECURITY",
     value: COOKIE,
@@ -150,77 +109,47 @@ async function initBrowser() {
   api = context.request;
   page = await context.newPage();
 
-  await page.goto("https://www.roblox.com/home", { waitUntil: "domcontentloaded", timeout: 60000 });
-  await page.waitForTimeout(1200);
+  await page.goto("https://www.roblox.com/home", { waitUntil: "domcontentloaded" });
 
-  const s = await validarAuth_viaPlaywright();
-  if (s !== 200) throw new Error(`Cookie não autenticou (status ${s}). Troque o ROBLOSECURITY.`);
-
-  await refreshCSRF_viaPlaywright();
-
-  await page.goto(AUDIT_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
-  await page.waitForTimeout(1200);
-}
-
-function sha256File(filepath) {
-  const buf = fs.readFileSync(filepath);
-  return crypto.createHash("sha256").update(buf).digest("hex");
-}
-
-async function capturarAudit() {
-  if (!page || page.isClosed()) await initBrowser();
-
-  try {
-    await page.reload({ waitUntil: "domcontentloaded", timeout: 60000 });
-  } catch {
-    await initBrowser();
-    await page.reload({ waitUntil: "domcontentloaded", timeout: 60000 });
+  const auth = await api.get("https://users.roblox.com/v1/users/authenticated");
+  if (auth.status() !== 200) {
+    console.error("❌ Cookie inválido.");
+    process.exit(1);
   }
 
-  await page.waitForTimeout(1200);
-  await page.screenshot({ path: "audit.png" });
+  const logout = await api.post("https://auth.roblox.com/v2/logout");
+  csrfToken = logout.headers()["x-csrf-token"];
+
+  await page.goto(AUDIT_URL, { waitUntil: "domcontentloaded" });
 }
 /* ========================================= */
 
+function sha256File(p) {
+  return crypto.createHash("sha256").update(fs.readFileSync(p)).digest("hex");
+}
+
 /* ================= OCR ================= */
-/**
- * Retorna eventos assim:
- * { actorText: "cami_hudson" OU "cami_hudzinha", action: "aceitou/recusou", when: "..."}
- *
- * A ideia é: OCR pode devolver displayName ou username — o resolver abaixo cuida disso.
- */
 async function ocrAuditEvents() {
   const base64 = fs.readFileSync("audit.png").toString("base64");
 
-  const resp = await openai.responses.create({
+  const res = await openai.responses.create({
     model: "gpt-4.1-mini",
-    max_output_tokens: 260,
     input: [{
       role: "user",
       content: [
         {
           type: "input_text",
           text:
-`Você está vendo o Audit Log de uma comunidade/grupo Roblox.
+`Leia o Audit Log do Roblox.
 
-Extraia SOMENTE eventos de pedidos de entrada (aceitou/recusou).
-Pegue APENAS o responsável (ator) — não pegue o usuário que foi aceito/recusado.
+REGRA OBRIGATÓRIA:
+- Use SOMENTE o @username (não use display name).
+- Se não houver @username visível, IGNORE o evento.
 
-O ator pode aparecer como:
-- Display Name grande (ex: "cami_hudson")
-- e abaixo "@username" pequeno (ex: "@cami_hudzinha")
+Formato:
+@username | aceitou OU recusou | tempo
 
-Se o @username estiver visível, use o @username (SEM @).
-Se não estiver, use o Display Name.
-
-Retorne UMA linha por evento no formato:
-
-ATOR | ACAO | QUANDO
-
-- ACAO: aceitou ou recusou
-- QUANDO: texto de tempo visível (ou "sem_tempo")
-
-Se não houver eventos desse tipo visíveis, responda exatamente:
+Se não houver eventos válidos, responda:
 SEM ALTERACOES`
         },
         { type: "input_image", image_url: `data:image/png;base64,${base64}` }
@@ -228,157 +157,72 @@ SEM ALTERACOES`
     }]
   });
 
-  const text = (resp.output_text || "").trim();
+  const text = (res.output_text || "").trim();
   if (!text || text === "SEM ALTERACOES") return [];
 
   return text
     .split("\n")
     .map(l => l.trim())
-    .filter(Boolean)
-    .filter(l => l.includes("|"))
+    .filter(l => l.startsWith("@"))
     .map(l => {
-      const [actorText, action, when] = l.split("|").map(x => x.trim());
-      const actorClean = (actorText || "").replace(/^@/g, "").trim();
-      return { actorText: actorClean, action: (action || "").toLowerCase(), when: when || "sem_tempo" };
-    })
-    .filter(e => e.actorText && (e.action === "aceitou" || e.action === "recusou"));
-}
-/* ========================================= */
-
-/* ================= RESOLVE USER ================= */
-function looksLikeUsername(s) {
-  // username roblox geralmente é [A-Za-z0-9_], sem espaços
-  // (não vou travar por tamanho pra não dar falso negativo)
-  return /^[A-Za-z0-9_]+$/.test(s);
-}
-
-/**
- * Resolve tanto username quanto displayName.
- * Retorna { userId, usernameReal } ou null
- */
-async function resolveUser(actorText) {
-  const query = String(actorText || "").trim().replace(/^@/g, "");
-  if (!query) return null;
-
-  // 1) tenta como username direto
-  if (looksLikeUsername(query)) {
-    const res = await api.post("https://users.roblox.com/v1/usernames/users", {
-      data: { usernames: [query], excludeBannedUsers: false }
+      const [u, action, when] = l.split("|").map(x => x.trim());
+      return {
+        username: u.replace("@", ""),
+        action,
+        when
+      };
     });
-
-    if (res.ok()) {
-      const body = await res.json();
-      const item = body?.data?.[0];
-      if (item?.id && item?.name) return { userId: item.id, usernameReal: item.name };
-    }
-  }
-
-  // 2) fallback: search por displayName / nome
-  const res2 = await api.get(`https://users.roblox.com/v1/users/search?keyword=${encodeURIComponent(query)}&limit=10`);
-  if (!res2.ok()) return null;
-
-  const body2 = await res2.json();
-  const list = body2?.data || [];
-
-  const lower = query.toLowerCase();
-
-  // match forte: displayName igual
-  const byDisplay = list.find(u => String(u?.displayName || "").toLowerCase() === lower);
-  if (byDisplay?.id && byDisplay?.name) return { userId: byDisplay.id, usernameReal: byDisplay.name };
-
-  // match forte: username igual
-  const byName = list.find(u => String(u?.name || "").toLowerCase() === lower);
-  if (byName?.id && byName?.name) return { userId: byName.id, usernameReal: byName.name };
-
-  // senão pega o primeiro resultado como último fallback
-  const first = list[0];
-  if (first?.id && first?.name) return { userId: first.id, usernameReal: first.name };
-
-  return null;
 }
 /* ========================================= */
 
-/* ================= KICK ================= */
-async function kickFromGroup(userId) {
-  if (!csrfToken) await refreshCSRF_viaPlaywright();
-
-  let res = await api.delete(`https://groups.roblox.com/v1/groups/${GROUP_ID}/users/${userId}`, {
-    headers: { "x-csrf-token": csrfToken }
+/* ================= ROBLOX ================= */
+async function resolveUserId(username) {
+  const res = await api.post("https://users.roblox.com/v1/usernames/users", {
+    data: { usernames: [username], excludeBannedUsers: false }
   });
+  if (!res.ok()) return null;
+  const j = await res.json();
+  return j?.data?.[0]?.id ?? null;
+}
 
-  if (res.status() === 403) {
-    await refreshCSRF_viaPlaywright();
-    res = await api.delete(`https://groups.roblox.com/v1/groups/${GROUP_ID}/users/${userId}`, {
-      headers: { "x-csrf-token": csrfToken }
-    });
-  }
-
-  if (res.status() === 401) {
-    throw new Error("Falha ao exilar (HTTP 401) User is not authenticated — cookie expirou ou sessão caiu.");
-  }
-
+async function kickFromGroup(userId) {
+  const res = await api.delete(
+    `https://groups.roblox.com/v1/groups/${GROUP_ID}/users/${userId}`,
+    { headers: { "x-csrf-token": csrfToken } }
+  );
   if (res.status() < 200 || res.status() >= 300) {
-    let body = "";
-    try { body = JSON.stringify(await res.json()).slice(0, 240); } catch {}
-    throw new Error(`Falha ao exilar (HTTP ${res.status()}) ${body}`);
+    throw new Error(`Kick falhou (${res.status()})`);
   }
 }
 /* ========================================= */
 
-/* ================= DETECÇÃO ================= */
-function now() { return Date.now(); }
-
-function recordActor(actor) {
-  const t = now();
-  if (!actorTimes.has(actor)) actorTimes.set(actor, []);
-  actorTimes.get(actor).push(t);
-
-  const cutoff = t - VOLUME_WINDOW_MS;
-  actorTimes.set(actor, actorTimes.get(actor).filter(x => x >= cutoff));
+function recordActor(u) {
+  const t = Date.now();
+  if (!actorTimes.has(u)) actorTimes.set(u, []);
+  actorTimes.get(u).push(t);
+  actorTimes.set(u, actorTimes.get(u).filter(x => t - x <= VOLUME_WINDOW_MS));
 }
 
-function shouldPunish(actor) {
+function shouldPunish(u) {
   if (TEST_MODE) return true;
-
-  const t = now();
-  const arr = actorTimes.get(actor) || [];
-  const burst = arr.filter(x => x >= t - BURST_WINDOW_MS).length;
-  const vol = arr.length;
-
-  return burst >= BURST_THRESHOLD || vol >= VOLUME_THRESHOLD;
+  const arr = actorTimes.get(u) || [];
+  const burst = arr.filter(x => Date.now() - x <= BURST_WINDOW_MS).length;
+  return burst >= BURST_THRESHOLD || arr.length >= VOLUME_THRESHOLD;
 }
 
-function canPunish(actor) {
-  return (punishedUntil.get(actor) || 0) <= now();
-}
+async function punishActor(username) {
+  if ((punishedUntil.get(username) || 0) > Date.now()) return;
 
-function markPunished(actor) {
-  punishedUntil.set(actor, now() + PUNISH_COOLDOWN_MS);
-}
-/* ========================================= */
-
-/* ================= PUNIÇÃO (Discord só sucesso) ================= */
-async function punishActor(actorText) {
-  if (!canPunish(actorText)) return;
-
-  try {
-    const resolved = await resolveUser(actorText);
-    if (!resolved?.userId || !resolved?.usernameReal) {
-      throw new Error(`Não consegui resolver userId/username para "${actorText}" (provável OCR pegou errado).`);
-    }
-
-    await kickFromGroup(resolved.userId);
-
-    // ✅ manda no Discord com username REAL (sem @)
-    await sendDiscord(formatRelatorioExilio(resolved.usernameReal));
-
-    markPunished(actorText);
-  } catch (e) {
-    // ❌ erros apenas no deploy logs
-    console.error(`⚠️ Falha ao exilar ${actorText}:`, String(e?.message || e));
+  const userId = await resolveUserId(username);
+  if (!userId) {
+    console.error(`❌ Username inválido: ${username}`);
+    return;
   }
+
+  await kickFromGroup(userId);
+  await sendDiscord(formatRelatorioExilio(username));
+  punishedUntil.set(username, Date.now() + PUNISH_COOLDOWN_MS);
 }
-/* ========================================= */
 
 /* ================= LOOP ================= */
 async function monitorar() {
@@ -386,63 +230,42 @@ async function monitorar() {
   running = true;
 
   try {
-    await capturarAudit();
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.screenshot({ path: "audit.png" });
 
     const h = sha256File("audit.png");
-    if (h === lastImgHash) {
-      try { fs.unlinkSync("audit.png"); } catch {}
-      return;
-    }
+    if (h === lastImgHash) return;
     lastImgHash = h;
 
     const events = await ocrAuditEvents();
-    try { fs.unlinkSync("audit.png"); } catch {}
-
-    // baseline: primeira leitura não pune
     if (!baselineReady) {
-      lastEventKeys = new Set(events.map(e => `${e.actorText}|${e.action}|${e.when}`));
+      lastEventKeys = new Set(events.map(e => `${e.username}|${e.action}|${e.when}`));
       baselineReady = true;
-      console.log("✅ Baseline setado. A partir da próxima mudança o bot começa a agir.");
+      console.log("✅ Baseline definido.");
       return;
     }
 
-    if (!events.length) return;
+    for (const e of events) {
+      const key = `${e.username}|${e.action}|${e.when}`;
+      if (lastEventKeys.has(key)) continue;
+      lastEventKeys.add(key);
 
-    const currentKeys = new Set(events.map(e => `${e.actorText}|${e.action}|${e.when}`));
-    const newKeys = [...currentKeys].filter(k => !lastEventKeys.has(k));
-    lastEventKeys = currentKeys;
-
-    if (!newKeys.length) return;
-
-    for (const k of newKeys) {
-      const [actorText] = k.split("|").map(x => x.trim());
-
-      recordActor(actorText);
-
-      if (shouldPunish(actorText)) {
-        await punishActor(actorText);
+      recordActor(e.username);
+      if (shouldPunish(e.username)) {
+        await punishActor(e.username);
       }
     }
-  } catch (err) {
-    console.error("Erro no monitor:", String(err?.message || err));
-    try { await closeSilently(); } catch {}
+
+  } catch (e) {
+    console.error("Erro:", e.message);
   } finally {
     running = false;
   }
 }
 
-process.on("unhandledRejection", (reason) => console.error("UnhandledRejection:", reason));
-process.on("uncaughtException", (err) => console.error("UncaughtException:", err));
-
 /* ================= START ================= */
 (async () => {
   await initBrowser();
-
-  console.log(`🛡️ Rodando | TEST_MODE=${TEST_MODE} | INTERVALO=${INTERVALO}ms`);
-  console.log("ℹ️ Primeira captura = baseline (não pune ninguém).");
-
-  // seta baseline imediatamente
-  await monitorar();
-
+  await monitorar(); // baseline
   setInterval(monitorar, INTERVALO);
 })();
