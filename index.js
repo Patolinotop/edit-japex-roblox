@@ -144,20 +144,21 @@ let lastImgHash = "";
 let lastEventKeys = new Set();
 const actorTimes = new Map();
 const punishedUntil = new Map();
+
+// ✅ baseline: na primeira leitura, aprende e não pune
+let baselineReady = false;
 /* ========================================= */
 
 /* ================= PLAYWRIGHT RUNTIME FALLBACK ================= */
 function ensurePlaywrightBrowsersInstalled() {
   try {
-    // se o ambiente não tiver browsers, tenta instalar em runtime
-    console.log("🔧 Verificando browsers do Playwright...");
+    console.log("🔧 Verificando/instalando browsers do Playwright...");
     execSync("npx playwright --version", { stdio: "inherit" });
     execSync("npx playwright install firefox", { stdio: "inherit" });
     console.log("✅ Browser Firefox pronto.");
   } catch (e) {
     console.error("❌ Falha ao instalar browsers via npx playwright install firefox.");
     console.error(String(e?.message || e));
-    // sem browsers, não adianta continuar
     process.exit(1);
   }
 }
@@ -181,10 +182,9 @@ async function initBrowser() {
   try {
     browser = await firefox.launch({ headless: true });
   } catch (e) {
-    // se falhar por "Executable doesn't exist", tenta instalar e repetir 1 vez
     const msg = String(e?.message || e);
     if (msg.includes("Executable doesn't exist")) {
-      console.error("⚠️ Firefox do Playwright não encontrado. Instalando browsers em runtime...");
+      console.error("⚠️ Firefox não encontrado. Instalando em runtime...");
       ensurePlaywrightBrowsersInstalled();
       browser = await firefox.launch({ headless: true });
     } else {
@@ -214,9 +214,7 @@ async function initBrowser() {
     return r.status;
   });
 
-  if (status !== 200) {
-    throw new Error("Cookie não logou no navegador (inválido/expirado/sem permissão).");
-  }
+  if (status !== 200) throw new Error("Cookie não logou no navegador (inválido/expirado/sem permissão).");
 
   await page.goto(AUDIT_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
   await page.waitForTimeout(1200);
@@ -318,7 +316,7 @@ function markPunished(actor) {
 }
 /* ========================================= */
 
-/* ================= PUNIÇÃO (DISCORD SÓ SUCESSO) ================= */
+/* ================= PUNIÇÃO ================= */
 async function punishActor(actor) {
   if (!canPunish(actor)) return;
 
@@ -328,12 +326,11 @@ async function punishActor(actor) {
 
     await kickFromGroup(userId);
 
-    // ✅ só manda relatório se o kick deu certo
+    // ✅ só manda relatório se kick deu certo
     await sendDiscord(formatRelatorioExilio(actor));
 
     markPunished(actor);
   } catch (e) {
-    // ❌ erros apenas no deploy logs
     console.error(`⚠️ Falha ao exilar ${actor}:`, String(e?.message || e));
   }
 }
@@ -356,6 +353,15 @@ async function monitorar() {
 
     const events = await ocrAuditEvents();
     try { fs.unlinkSync("audit.png"); } catch {}
+
+    // ✅ primeira leitura após start: baseline (não pune)
+    if (!baselineReady) {
+      const keys = new Set(events.map(e => `${e.actor}|${e.action}|${e.when}`));
+      lastEventKeys = keys;
+      baselineReady = true;
+      console.log("✅ Baseline setado. A partir da próxima mudança o bot começa a agir.");
+      return;
+    }
 
     if (!events.length) return;
 
@@ -381,13 +387,8 @@ async function monitorar() {
   }
 }
 
-process.on("unhandledRejection", (reason) => {
-  console.error("UnhandledRejection:", reason);
-});
-
-process.on("uncaughtException", (err) => {
-  console.error("UncaughtException:", err);
-});
+process.on("unhandledRejection", (reason) => console.error("UnhandledRejection:", reason));
+process.on("uncaughtException", (err) => console.error("UncaughtException:", err));
 
 /* ================= START ================= */
 (async () => {
@@ -401,5 +402,9 @@ process.on("uncaughtException", (err) => {
   await initBrowser();
 
   console.log(`🛡️ Rodando | TEST_MODE=${TEST_MODE} | INTERVALO=${INTERVALO}ms`);
+  console.log("ℹ️ Primeira captura = baseline (não pune ninguém).");
   setInterval(monitorar, INTERVALO);
+
+  // opcional: roda uma vez logo ao iniciar pra setar baseline mais rápido
+  await monitorar();
 })();
