@@ -9,9 +9,9 @@ const COOKIE = process.env.ROBLOSECURITY;
 const WEBHOOK = process.env.DISCORD_WEBHOOK;
 const OPENAI_KEY = process.env.OPENAI_API_KEY;
 
-const INTERVALO = 5000;      // 5s teste
-const JANELA_MS = 10000;     // 10s
-const LIMITE_RAPIDO = 3;     // suspeito
+const INTERVALO = 5000;       // 5s (teste)
+const JANELA_MS = 10000;      // 10s
+const LIMITE_RAPIDO = 3;      // suspeito
 /* ========================================= */
 
 if (!GROUP_ID || !COOKIE || !WEBHOOK || !OPENAI_KEY) {
@@ -25,18 +25,28 @@ const historico = new Map();
 let ultimoTexto = "";
 let running = false;
 
-// sessão do browser (reuso)
+// Reuso do browser pra ficar leve/estável
 let browser = null;
 let context = null;
 let page = null;
 
-const AUDIT_URL = `https://www.roblox.com/groups/${GROUP_ID}/audit-log`;
+// URL mais consistente do Audit Log (configure + hash route) :contentReference[oaicite:1]{index=1}
+const AUDIT_URL = `https://www.roblox.com/groups/configure?id=${GROUP_ID}#!/auditLog`;
+
+async function closeSilently() {
+  try { if (page && !page.isClosed()) await page.close(); } catch {}
+  try { if (context) await context.close(); } catch {}
+  try { if (browser) await browser.close(); } catch {}
+  page = null; context = null; browser = null;
+}
 
 async function initBrowser() {
-  await closeBrowserSilently();
+  await closeSilently();
 
   browser = await firefox.launch({ headless: true });
-  context = await browser.newContext();
+  context = await browser.newContext({
+    viewport: { width: 1280, height: 720 } // menos memória
+  });
 
   await context.addCookies([{
     name: ".ROBLOSECURITY",
@@ -49,25 +59,30 @@ async function initBrowser() {
 
   page = await context.newPage();
 
-  await page.goto(AUDIT_URL, {
-    waitUntil: "domcontentloaded",
-    timeout: 60000
-  });
-
-  // uma “aquecida”
+  // Se Roblox redirecionar pra outra coisa, a gente ainda continua e tira screenshot do que abriu,
+  // mas pelo menos começamos pelo endpoint certo do audit log.
+  await page.goto(AUDIT_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
   await page.waitForTimeout(2000);
 }
 
-async function closeBrowserSilently() {
-  try { if (page) await page.close(); } catch {}
-  try { if (context) await context.close(); } catch {}
-  try { if (browser) await browser.close(); } catch {}
-  page = null; context = null; browser = null;
+async function ensurePage() {
+  if (!page || page.isClosed()) {
+    await initBrowser();
+  }
 }
 
 async function capturarAudit() {
-  // Recarrega pra pegar novidades
-  await page.reload({ waitUntil: "domcontentloaded", timeout: 60000 });
+  await ensurePage();
+
+  // reload com proteção (às vezes a página fecha)
+  try {
+    await page.reload({ waitUntil: "domcontentloaded", timeout: 60000 });
+  } catch {
+    // se falhou, reinicia e tenta 1 vez
+    await initBrowser();
+    await page.reload({ waitUntil: "domcontentloaded", timeout: 60000 });
+  }
+
   await page.waitForTimeout(2500);
   await page.screenshot({ path: "audit.png" });
 }
@@ -93,7 +108,7 @@ RESPONSAVEL | ACAO | ALVO
 Exemplo:
 Japex | aceitou | Player123
 
-Se não houver alterações relevantes, responda exatamente:
+Se não houver alterações, responda exatamente:
 SEM ALTERACOES`
           },
           {
@@ -105,7 +120,6 @@ SEM ALTERACOES`
     ]
   });
 
-  // apaga sempre
   try { fs.unlinkSync("audit.png"); } catch {}
   return (response.output_text || "").trim();
 }
@@ -143,7 +157,7 @@ async function processarTexto(texto) {
       motivo += " (atividade rápida suspeita)";
     }
 
-    // (modo teste): qualquer alteração manda webhook
+    // modo teste: qualquer alteração manda webhook
     await enviarWebhook(ator, alvo, motivo);
   }
 }
@@ -153,21 +167,13 @@ async function monitorar() {
   running = true;
 
   try {
-    if (!page) await initBrowser();
-
     await capturarAudit();
     const texto = await analisarImagem();
 
-    if (!texto || texto === "SEM ALTERACOES") {
-      running = false;
-      return;
-    }
+    if (!texto || texto === "SEM ALTERACOES") return;
 
-    // evita spam se a OCR repetir exatamente
-    if (texto === ultimoTexto) {
-      running = false;
-      return;
-    }
+    // evita spam: se OCR vier idêntico, não manda de novo
+    if (texto === ultimoTexto) return;
     ultimoTexto = texto;
 
     await processarTexto(texto);
@@ -175,14 +181,9 @@ async function monitorar() {
   } catch (err) {
     console.error("Erro no monitor:", err.message);
 
-    // se o browser morreu, reinicia
-    const msg = String(err.message || "");
-    if (
-      msg.includes("Target closed") ||
-      msg.includes("has been closed") ||
-      msg.includes("browserType.launch") ||
-      msg.includes("Executable doesn't exist")
-    ) {
+    // se algo fechou, reinicia a sessão
+    const m = String(err.message || "");
+    if (m.includes("Target page") || m.includes("has been closed") || m.includes("Target closed")) {
       try { await initBrowser(); } catch {}
     }
   } finally {
