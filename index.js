@@ -3,6 +3,7 @@ import OpenAI from "openai";
 import axios from "axios";
 import fs from "fs";
 import crypto from "crypto";
+import { execSync } from "child_process";
 
 /* ================= CONFIG ================= */
 const GROUP_ID = process.env.GROUP_ID;
@@ -12,22 +13,17 @@ const OPENAI_KEY = process.env.OPENAI_API_KEY;
 
 const DISCORD_RESPONSAVEL_ID = "1455692969322614895";
 
-// teste: 5000 | produção: 300000 (5 min)
 const INTERVALO = Number(process.env.INTERVALO_MS || "5000");
-
-// TEST_MODE=1 => 1 evento já tenta exilar (pra teste)
 const TEST_MODE = String(process.env.TEST_MODE || "1") === "1";
 
-// regras (quando TEST_MODE=0)
 const BURST_WINDOW_MS = 10_000;
 const BURST_THRESHOLD = 3;
 
-const VOLUME_WINDOW_MS = 300_000; // 5 min
+const VOLUME_WINDOW_MS = 300_000;
 const VOLUME_THRESHOLD = 10;
 
 const PUNISH_COOLDOWN_MS = 30 * 60 * 1000;
 
-// audit log (mais estável que /audit-log em muitos casos)
 const AUDIT_URL = `https://www.roblox.com/groups/configure?id=${GROUP_ID}#!/auditLog`;
 /* ========================================= */
 
@@ -109,7 +105,6 @@ async function kickFromGroup(userId) {
 
   let res = await roblox.delete(`https://groups.roblox.com/v1/groups/${GROUP_ID}/users/${userId}`);
 
-  // tenta renovar token e repetir uma vez
   if (res.status === 403 || res.status === 400) {
     await refreshCSRF();
     res = await roblox.delete(`https://groups.roblox.com/v1/groups/${GROUP_ID}/users/${userId}`);
@@ -122,7 +117,7 @@ async function kickFromGroup(userId) {
 }
 /* ========================================= */
 
-/* ================= DISCORD (SÓ RELATÓRIO) ================= */
+/* ================= DISCORD (SÓ SUCESSO) ================= */
 async function sendDiscord(content) {
   await axios.post(WEBHOOK, { content });
 }
@@ -146,9 +141,26 @@ Data: ${data}***`
 /* ================= STATE ================= */
 let running = false;
 let lastImgHash = "";
-let lastEventKeys = new Set();        // dedupe OCR keys
-const actorTimes = new Map();         // actor -> timestamps
-const punishedUntil = new Map();      // actor -> cooldownUntil
+let lastEventKeys = new Set();
+const actorTimes = new Map();
+const punishedUntil = new Map();
+/* ========================================= */
+
+/* ================= PLAYWRIGHT RUNTIME FALLBACK ================= */
+function ensurePlaywrightBrowsersInstalled() {
+  try {
+    // se o ambiente não tiver browsers, tenta instalar em runtime
+    console.log("🔧 Verificando browsers do Playwright...");
+    execSync("npx playwright --version", { stdio: "inherit" });
+    execSync("npx playwright install firefox", { stdio: "inherit" });
+    console.log("✅ Browser Firefox pronto.");
+  } catch (e) {
+    console.error("❌ Falha ao instalar browsers via npx playwright install firefox.");
+    console.error(String(e?.message || e));
+    // sem browsers, não adianta continuar
+    process.exit(1);
+  }
+}
 /* ========================================= */
 
 /* ================= PLAYWRIGHT ================= */
@@ -166,7 +178,20 @@ async function closeSilently() {
 async function initBrowser() {
   await closeSilently();
 
-  browser = await firefox.launch({ headless: true });
+  try {
+    browser = await firefox.launch({ headless: true });
+  } catch (e) {
+    // se falhar por "Executable doesn't exist", tenta instalar e repetir 1 vez
+    const msg = String(e?.message || e);
+    if (msg.includes("Executable doesn't exist")) {
+      console.error("⚠️ Firefox do Playwright não encontrado. Instalando browsers em runtime...");
+      ensurePlaywrightBrowsersInstalled();
+      browser = await firefox.launch({ headless: true });
+    } else {
+      throw e;
+    }
+  }
+
   context = await browser.newContext({ viewport: { width: 1280, height: 720 } });
 
   await context.addCookies([{
@@ -269,7 +294,6 @@ function recordActor(actor) {
   if (!actorTimes.has(actor)) actorTimes.set(actor, []);
   actorTimes.get(actor).push(t);
 
-  // limpa > 5min
   const cutoff = t - VOLUME_WINDOW_MS;
   actorTimes.set(actor, actorTimes.get(actor).filter(x => x >= cutoff));
 }
@@ -279,7 +303,6 @@ function shouldPunish(actor) {
 
   const t = now();
   const arr = actorTimes.get(actor) || [];
-
   const burst = arr.filter(x => x >= t - BURST_WINDOW_MS).length;
   const vol = arr.length;
 
@@ -295,7 +318,7 @@ function markPunished(actor) {
 }
 /* ========================================= */
 
-/* ================= PUNIÇÃO ================= */
+/* ================= PUNIÇÃO (DISCORD SÓ SUCESSO) ================= */
 async function punishActor(actor) {
   if (!canPunish(actor)) return;
 
@@ -305,13 +328,13 @@ async function punishActor(actor) {
 
     await kickFromGroup(userId);
 
-    // ✅ Só manda relatório se realmente exilou
+    // ✅ só manda relatório se o kick deu certo
     await sendDiscord(formatRelatorioExilio(actor));
 
     markPunished(actor);
   } catch (e) {
-    // ❌ erro somente no console
-    console.error(`⚠️ Falha ao punir/exilar ${actor}:`, String(e?.message || e));
+    // ❌ erros apenas no deploy logs
+    console.error(`⚠️ Falha ao exilar ${actor}:`, String(e?.message || e));
   }
 }
 /* ========================================= */
@@ -332,12 +355,10 @@ async function monitorar() {
     lastImgHash = h;
 
     const events = await ocrAuditEvents();
-
     try { fs.unlinkSync("audit.png"); } catch {}
 
     if (!events.length) return;
 
-    // dedupe por "actor|action|when"
     const currentKeys = new Set(events.map(e => `${e.actor}|${e.action}|${e.when}`));
     const newKeys = [...currentKeys].filter(k => !lastEventKeys.has(k));
     lastEventKeys = currentKeys;
@@ -346,7 +367,6 @@ async function monitorar() {
 
     for (const k of newKeys) {
       const [actor] = k.split("|").map(x => x.trim());
-
       recordActor(actor);
 
       if (shouldPunish(actor)) {
