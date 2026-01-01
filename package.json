@@ -1,6 +1,6 @@
 {
   "name": "roblox-audit-guard",
-  "version": "10.1.0",
+  "version": "10.2.0",
   "type": "module",
   "main": "index.js",
   "scripts": {
