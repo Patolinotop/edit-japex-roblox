@@ -3,6 +3,7 @@ import OpenAI from "openai";
 import axios from "axios";
 import fs from "fs";
 import crypto from "crypto";
+import FormData from "form-data";
 import { execSync } from "child_process";
 
 /* ================= CONFIG ================= */
@@ -13,19 +14,18 @@ const OPENAI_KEY = process.env.OPENAI_API_KEY;
 
 const DISCORD_RESPONSAVEL_ID = "1455692969322614895";
 
-const INTERVALO = Number(process.env.INTERVALO_MS || "300000"); // produção: 5 min
-const TEST_MODE = String(process.env.TEST_MODE || "0") === "1"; // ✅ padrão OFF
+const INTERVALO = Number(process.env.INTERVALO_MS || "300000"); // 5 min default
+const TEST_MODE = String(process.env.TEST_MODE || "0") === "1";
 
-// ✅ regra nova: 3+ ações no MESMO minuto => exílio
+// Regra: 3+ ações (aceitou/recusou) no MESMO minuto pelo mesmo cara => exílio
 const SAME_MINUTE_THRESHOLD = Number(process.env.SAME_MINUTE_THRESHOLD || "3");
-
-// (extra anti-bypass opcional) volume em 5 min
-const VOLUME_WINDOW_MS = 300_000;
-const VOLUME_THRESHOLD = Number(process.env.VOLUME_THRESHOLD || "10");
 
 const PUNISH_COOLDOWN_MS = 30 * 60 * 1000;
 
 const AUDIT_URL = `https://www.roblox.com/groups/configure?id=${GROUP_ID}#!/auditLog`;
+
+// Modelo mais “carinho”, sem raciocínio pesado
+const VISION_MODEL = process.env.VISION_MODEL || "gpt-4.1";
 /* ========================================= */
 
 if (!GROUP_ID || !COOKIE || !WEBHOOK || !OPENAI_KEY) {
@@ -44,9 +44,29 @@ if (COOKIE.startsWith(".ROBLOSECURITY=")) {
 
 const openai = new OpenAI({ apiKey: OPENAI_KEY });
 
-/* ================= DISCORD ================= */
-async function sendDiscord(content) {
-  await axios.post(WEBHOOK, { content });
+/* ================= DISCORD (com anexo) ================= */
+async function sendDiscord(content, imagePath = null) {
+  try {
+    if (!imagePath) {
+      await axios.post(WEBHOOK, { content });
+      return;
+    }
+
+    const form = new FormData();
+    form.append("payload_json", JSON.stringify({ content }));
+    form.append("file", fs.createReadStream(imagePath), { filename: "auditoria.png" });
+
+    const res = await axios.post(WEBHOOK, form, { headers: form.getHeaders(), validateStatus: () => true });
+
+    // retry simples se rate-limit
+    if (res.status === 429) {
+      const retryAfter = Number(res.headers["retry-after"]) || 1;
+      await new Promise(r => setTimeout(r, retryAfter * 1000));
+      await axios.post(WEBHOOK, form, { headers: form.getHeaders(), validateStatus: () => true });
+    }
+  } catch (e) {
+    console.error("⚠️ Discord falhou:", String(e?.message || e));
+  }
 }
 
 function formatRelatorioExilio(usernameSemArroba) {
@@ -67,28 +87,22 @@ Data: ${data}***`
 
 /* ================= STATE ================= */
 let running = false;
-let lastImgHash = "";
-let lastEventKeys = new Set();
 let baselineReady = false;
 
-const punishedUntil = new Map(); // nameKey -> cooldownUntil
+let lastImgHash = "";
+let lastEventKeys = new Set();
 
-// Para regra "mesmo minuto"
-const actorMinuteCounts = new Map(); // actorKey -> Map(minuteKey -> count)
-
-// (extra) para volume em 5 min
-const actorTimes = new Map(); // actorKey -> timestamps[]
+const punishedUntil = new Map();         // actorKey -> cooldownUntil
+const actorMinuteCounts = new Map();     // actorKey -> Map(minuteKey -> count)
 /* ========================================= */
 
 /* ================= PLAYWRIGHT FALLBACK ================= */
 function ensurePlaywrightBrowsersInstalled() {
   try {
-    console.log("🔧 Verificando/instalando browsers do Playwright...");
-    execSync("npx playwright --version", { stdio: "inherit" });
+    console.log("🔧 Instalando browsers do Playwright (firefox)...");
     execSync("npx playwright install firefox", { stdio: "inherit" });
-    console.log("✅ Browser Firefox pronto.");
   } catch (e) {
-    console.error("❌ Falha ao instalar browsers via npx playwright install firefox.");
+    console.error("❌ Falha ao instalar browsers do Playwright.");
     console.error(String(e?.message || e));
     process.exit(1);
   }
@@ -129,7 +143,6 @@ async function initBrowser() {
   } catch (e) {
     const msg = String(e?.message || e);
     if (msg.includes("Executable doesn't exist")) {
-      console.error("⚠️ Firefox do Playwright não encontrado. Instalando em runtime...");
       ensurePlaywrightBrowsersInstalled();
       browser = await firefox.launch({ headless: true });
     } else {
@@ -137,8 +150,7 @@ async function initBrowser() {
     }
   }
 
-  context = await browser.newContext({ viewport: { width: 1280, height: 720 } });
-
+  context = await browser.newContext({ viewport: { width: 1366, height: 768 } });
   await context.addCookies([{
     name: ".ROBLOSECURITY",
     value: COOKIE,
@@ -153,7 +165,7 @@ async function initBrowser() {
   page = await context.newPage();
 
   await page.goto("https://www.roblox.com/home", { waitUntil: "domcontentloaded", timeout: 60000 });
-  await page.waitForTimeout(1200);
+  await page.waitForTimeout(1000);
 
   const s = await authStatus();
   if (s !== 200) throw new Error(`ROBLOSECURITY inválido/expirado (status ${s}).`);
@@ -162,6 +174,44 @@ async function initBrowser() {
 
   await page.goto(AUDIT_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
   await page.waitForTimeout(1200);
+
+  // tenta aplicar filtro da UI (se falhar, ok)
+  await ensureEntryRequestFilter();
+}
+
+// tenta deixar a aba/filtro em "Aceitar pedido de entrada"
+async function ensureEntryRequestFilter() {
+  try {
+    // 1) tenta achar algo clicável com "Tudo"
+    const tudo = page.getByText("Tudo", { exact: true }).first();
+    if (await tudo.count()) {
+      await tudo.click({ timeout: 1500 }).catch(() => {});
+      await page.waitForTimeout(300);
+    }
+
+    // 2) tenta clicar na opção "Aceitar pedido de entrada"
+    // (às vezes aparece como menu/combobox)
+    const opt = page.getByText("Aceitar pedido de entrada", { exact: false }).first();
+    if (await opt.count()) {
+      await opt.click({ timeout: 1500 }).catch(() => {});
+      await page.waitForTimeout(400);
+    }
+  } catch {
+    // silêncio: filtro pode variar, OCR já filtra por texto
+  }
+}
+
+// só mantém 2 prints: prev e last
+function rotateScreenshots() {
+  try {
+    if (fs.existsSync("audit_last.png")) {
+      try { fs.unlinkSync("audit_prev.png"); } catch {}
+      fs.renameSync("audit_last.png", "audit_prev.png");
+    }
+    fs.renameSync("audit_new.png", "audit_last.png");
+  } catch (e) {
+    console.error("⚠️ Falha rotacionando prints:", String(e?.message || e));
+  }
 }
 
 function sha256File(filepath) {
@@ -180,64 +230,60 @@ async function capturarAudit() {
   }
 
   await page.waitForTimeout(1200);
-  await page.screenshot({ path: "audit.png" });
+  await ensureEntryRequestFilter(); // garante filtro sempre que der
+  await page.waitForTimeout(500);
+
+  await page.screenshot({ path: "audit_new.png" });
+  rotateScreenshots();
 }
 /* ========================================= */
 
-/* ================= OCR ================= */
+/* ================= OCR (filtro forte) ================= */
 function isLikelyUsername(s) {
   const t = String(s || "").trim().replace(/^@/, "");
   return /^[a-zA-Z0-9_]{3,20}$/.test(t);
 }
 
-// tenta extrair algo do tipo "01 de jan. de 2026 03:30" ou só "03:30"
 function normalizeMinuteKey(whenRaw) {
   const w = String(whenRaw || "").trim();
-
-  // pega HH:MM se existir
   const hm = w.match(/(\d{1,2}:\d{2})/);
-  const hhmm = hm ? hm[1] : null;
-
-  // tenta pegar parte de data PT-BR (bem permissivo)
-  // ex: "01 de jan. de 2026"
-  const datePt = w.match(/(\d{1,2}\s+de\s+[a-zçãé\.]+(?:\s+de)?\s+\d{4})/i);
-  const datePart = datePt ? datePt[1].toLowerCase() : null;
-
-  if (datePart && hhmm) return `${datePart} ${hhmm}`;
-  if (hhmm) return hhmm;
-
-  // se não tem nada útil, cai pro minuto atual do servidor
-  const d = new Date();
-  const pad = (n) => String(n).padStart(2, "0");
-  return `local ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  return hm ? hm[1] : "unknown";
 }
 
 async function ocrAuditEvents() {
-  const base64 = fs.readFileSync("audit.png").toString("base64");
+  const base64 = fs.readFileSync("audit_last.png").toString("base64");
 
   const resp = await openai.responses.create({
-    model: "gpt-4.1-mini",
-    max_output_tokens: 320,
+    model: VISION_MODEL,
+    max_output_tokens: 220,
     input: [{
       role: "user",
       content: [
         {
           type: "input_text",
           text:
-`Você está vendo o Audit Log de um grupo/comunidade Roblox.
+`Você está vendo a página "Atividade do grupo" (audit log) do Roblox.
 
-Extraia SOMENTE eventos de pedidos de entrada (aceitou/recusou).
-IMPORTANTE:
-- Se aparecer Display Name grande e abaixo "@username", use SEMPRE o @username (sem @ no output).
-- Se NÃO aparecer @username, retorne o Display Name mesmo assim (pra eu resolver depois).
-- QUANDO: copie o tempo visível exatamente (ex: "01 de jan. de 2026 03:30" ou "03:30").
+TAREFA: Extraia SOMENTE eventos de PEDIDO DE ENTRADA.
+- Aceitar pedido de entrada
+- Recusar pedido de entrada
 
-Formato (1 linha por evento):
+IGNORE COMPLETAMENTE:
+- mudança de cargo
+- remoção/ban
+- qualquer outra ação
+
+Se o evento NÃO contiver explicitamente a expressão "pedido de entrada" na descrição, NÃO inclua.
+
+Retorne UMA linha por evento no formato:
 NOME | ACAO | QUANDO
 
-- ACAO: aceitou ou recusou
+Regras:
+- NOME: use o @username (sem "@") se estiver visível. Se só tiver display name, retorne o display name mesmo assim.
+- ACAO: "aceitou" ou "recusou"
+- QUANDO: copie o tempo visível (precisa conter HH:MM se aparecer)
 
-Se não houver eventos desse tipo, responda exatamente:
+Se não houver eventos de pedido de entrada visíveis, responda exatamente:
 SEM ALTERACOES`
         },
         { type: "input_image", image_url: `data:image/png;base64,${base64}` }
@@ -326,9 +372,7 @@ async function kickFromGroup(userId) {
     });
   }
 
-  if (res.status() === 401) {
-    throw new Error(`HTTP 401 (User is not authenticated) — cookie expirou/foi invalidado.`);
-  }
+  if (res.status() === 401) throw new Error("HTTP 401 (cookie inválido/expirou).");
 
   if (res.status() < 200 || res.status() >= 300) {
     let body = "";
@@ -349,7 +393,6 @@ function markPunished(key) {
   punishedUntil.set(key, now() + PUNISH_COOLDOWN_MS);
 }
 
-// conta por minuto (mesmo minuto => soma)
 function recordMinute(actorKey, minuteKey) {
   if (!actorMinuteCounts.has(actorKey)) actorMinuteCounts.set(actorKey, new Map());
   const m = actorMinuteCounts.get(actorKey);
@@ -357,9 +400,8 @@ function recordMinute(actorKey, minuteKey) {
   const cur = (m.get(minuteKey) || 0) + 1;
   m.set(minuteKey, cur);
 
-  // limpa minutos velhos (mantém só últimos ~5 minutos por segurança)
+  // mantém poucos minutos por actor
   if (m.size > 8) {
-    // remove chaves mais antigas por ordem de inserção
     const keys = [...m.keys()];
     for (let i = 0; i < keys.length - 8; i++) m.delete(keys[i]);
   }
@@ -367,26 +409,9 @@ function recordMinute(actorKey, minuteKey) {
   return cur;
 }
 
-// (extra) volume em 5 min
-function recordVolume(actorKey) {
-  const t = now();
-  if (!actorTimes.has(actorKey)) actorTimes.set(actorKey, []);
-  actorTimes.get(actorKey).push(t);
-  const cutoff = t - VOLUME_WINDOW_MS;
-  actorTimes.set(actorKey, actorTimes.get(actorKey).filter(x => x >= cutoff));
-  return actorTimes.get(actorKey).length;
-}
-
-function shouldPunish(actorKey, minuteCount, volumeCount) {
+function shouldPunish(minuteCount) {
   if (TEST_MODE) return true;
-
-  // ✅ regra pedida:
-  if (minuteCount >= SAME_MINUTE_THRESHOLD) return true;
-
-  // extra anti-bypass (se quiser manter)
-  if (volumeCount >= VOLUME_THRESHOLD) return true;
-
-  return false;
+  return minuteCount >= SAME_MINUTE_THRESHOLD;
 }
 /* ========================================= */
 
@@ -416,13 +441,8 @@ async function punishActor(actorKey) {
   // 2) cooldown
   markPunished(actorKey);
 
-  // 3) relatório
-  try {
-    await sendDiscord(formatRelatorioExilio(usernameForReport));
-    console.log(`📣 Relatório enviado no Discord: ${usernameForReport}`);
-  } catch (e) {
-    console.error(`⚠️ Discord falhou ao enviar relatório (${usernameForReport}):`, String(e?.message || e));
-  }
+  // 3) relatório + print (audit_last.png)
+  await sendDiscord(formatRelatorioExilio(usernameForReport), "audit_last.png");
 }
 /* ========================================= */
 
@@ -434,15 +454,11 @@ async function monitorar() {
   try {
     await capturarAudit();
 
-    const h = sha256File("audit.png");
-    if (h === lastImgHash) {
-      try { fs.unlinkSync("audit.png"); } catch {}
-      return;
-    }
+    const h = sha256File("audit_last.png");
+    if (h === lastImgHash) return;
     lastImgHash = h;
 
     const events = await ocrAuditEvents();
-    try { fs.unlinkSync("audit.png"); } catch {}
 
     // baseline
     if (!baselineReady) {
@@ -460,20 +476,16 @@ async function monitorar() {
 
     if (!newKeys.length) return;
 
-    // processa eventos novos
-    for (const key of newKeys) {
-      const [name, action, when] = key.split("|").map(x => x.trim());
-
+    for (const k of newKeys) {
+      const [name, action, when] = k.split("|").map(x => x.trim());
       const actorKey = name.replace(/^@/, "").trim();
       const minuteKey = normalizeMinuteKey(when);
 
       const minuteCount = recordMinute(actorKey, minuteKey);
-      const volumeCount = recordVolume(actorKey);
 
-      // log debug útil
-      console.log(`📌 Evento: ${actorKey} ${action} | minuto="${minuteKey}" | countMin=${minuteCount} | vol5m=${volumeCount}`);
+      console.log(`📌 Evento pedido-entrada: ${actorKey} ${action} | minuto="${minuteKey}" | countMin=${minuteCount}`);
 
-      if (shouldPunish(actorKey, minuteCount, volumeCount)) {
+      if (shouldPunish(minuteCount)) {
         await punishActor(actorKey);
       }
     }
@@ -491,11 +503,10 @@ process.on("uncaughtException", (err) => console.error("UncaughtException:", err
 /* ================= START ================= */
 (async () => {
   await initBrowser();
-
-  console.log(`🛡️ Rodando | TEST_MODE=${TEST_MODE} | INTERVALO=${INTERVALO}ms`);
-  console.log(`✅ Regra: >=${SAME_MINUTE_THRESHOLD} ações no mesmo minuto (mesmo usuário) => exílio.`);
+  console.log(`🛡️ Rodando | MODEL=${VISION_MODEL} | TEST_MODE=${TEST_MODE} | INTERVALO=${INTERVALO}ms`);
+  console.log(`✅ Regra: >=${SAME_MINUTE_THRESHOLD} ações (aceitar/recusar pedido de entrada) no mesmo minuto => exílio.`);
   console.log("ℹ️ Primeira captura = baseline (não pune ninguém).");
 
-  await monitorar(); // seta baseline
+  await monitorar(); // baseline
   setInterval(monitorar, INTERVALO);
 })();
