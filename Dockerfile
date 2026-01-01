@@ -5,7 +5,7 @@ WORKDIR /app
 COPY package.json package-lock.json* ./
 RUN npm install
 
-# Garante que o Firefox correto exista (evita o erro "Executable doesn't exist")
+# garante que o Firefox certo existe dentro da imagem
 RUN npx playwright install firefox
 
 COPY . .
