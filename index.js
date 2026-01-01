@@ -13,14 +13,15 @@ const OPENAI_KEY = process.env.OPENAI_API_KEY;
 
 const DISCORD_RESPONSAVEL_ID = "1455692969322614895";
 
-const INTERVALO = Number(process.env.INTERVALO_MS || "5000");
-const TEST_MODE = String(process.env.TEST_MODE || "1") === "1";
+const INTERVALO = Number(process.env.INTERVALO_MS || "300000"); // produção: 5 min
+const TEST_MODE = String(process.env.TEST_MODE || "0") === "1"; // ✅ padrão OFF
 
-const BURST_WINDOW_MS = 10_000;
-const BURST_THRESHOLD = 3;
+// ✅ regra nova: 3+ ações no MESMO minuto => exílio
+const SAME_MINUTE_THRESHOLD = Number(process.env.SAME_MINUTE_THRESHOLD || "3");
 
-const VOLUME_WINDOW_MS = 300_000; // 5 min
-const VOLUME_THRESHOLD = 10;
+// (extra anti-bypass opcional) volume em 5 min
+const VOLUME_WINDOW_MS = 300_000;
+const VOLUME_THRESHOLD = Number(process.env.VOLUME_THRESHOLD || "10");
 
 const PUNISH_COOLDOWN_MS = 30 * 60 * 1000;
 
@@ -68,9 +69,15 @@ Data: ${data}***`
 let running = false;
 let lastImgHash = "";
 let lastEventKeys = new Set();
-const actorTimes = new Map();
-const punishedUntil = new Map();
 let baselineReady = false;
+
+const punishedUntil = new Map(); // nameKey -> cooldownUntil
+
+// Para regra "mesmo minuto"
+const actorMinuteCounts = new Map(); // actorKey -> Map(minuteKey -> count)
+
+// (extra) para volume em 5 min
+const actorTimes = new Map(); // actorKey -> timestamps[]
 /* ========================================= */
 
 /* ================= PLAYWRIGHT FALLBACK ================= */
@@ -88,7 +95,7 @@ function ensurePlaywrightBrowsersInstalled() {
 }
 /* ========================================= */
 
-/* ================= PLAYWRIGHT + API (cookies do browser) ================= */
+/* ================= PLAYWRIGHT + API ================= */
 let browser = null;
 let context = null;
 let page = null;
@@ -179,9 +186,30 @@ async function capturarAudit() {
 
 /* ================= OCR ================= */
 function isLikelyUsername(s) {
-  // username Roblox: letras/números/_ (sem espaços), 3-20 chars (geralmente)
   const t = String(s || "").trim().replace(/^@/, "");
   return /^[a-zA-Z0-9_]{3,20}$/.test(t);
+}
+
+// tenta extrair algo do tipo "01 de jan. de 2026 03:30" ou só "03:30"
+function normalizeMinuteKey(whenRaw) {
+  const w = String(whenRaw || "").trim();
+
+  // pega HH:MM se existir
+  const hm = w.match(/(\d{1,2}:\d{2})/);
+  const hhmm = hm ? hm[1] : null;
+
+  // tenta pegar parte de data PT-BR (bem permissivo)
+  // ex: "01 de jan. de 2026"
+  const datePt = w.match(/(\d{1,2}\s+de\s+[a-zçãé\.]+(?:\s+de)?\s+\d{4})/i);
+  const datePart = datePt ? datePt[1].toLowerCase() : null;
+
+  if (datePart && hhmm) return `${datePart} ${hhmm}`;
+  if (hhmm) return hhmm;
+
+  // se não tem nada útil, cai pro minuto atual do servidor
+  const d = new Date();
+  const pad = (n) => String(n).padStart(2, "0");
+  return `local ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
 async function ocrAuditEvents() {
@@ -189,7 +217,7 @@ async function ocrAuditEvents() {
 
   const resp = await openai.responses.create({
     model: "gpt-4.1-mini",
-    max_output_tokens: 280,
+    max_output_tokens: 320,
     input: [{
       role: "user",
       content: [
@@ -200,15 +228,14 @@ async function ocrAuditEvents() {
 
 Extraia SOMENTE eventos de pedidos de entrada (aceitou/recusou).
 IMPORTANTE:
-- Se aparecer Display Name grande e abaixo "@username", use SEMPRE o @username.
-- Retorne o USERNAME sem o "@". (ex: cami_hudzinha)
-- Se NÃO aparecer @username na linha, retorne o Display Name mesmo assim (ex: "Cami Hudson") para eu tentar resolver depois.
+- Se aparecer Display Name grande e abaixo "@username", use SEMPRE o @username (sem @ no output).
+- Se NÃO aparecer @username, retorne o Display Name mesmo assim (pra eu resolver depois).
+- QUANDO: copie o tempo visível exatamente (ex: "01 de jan. de 2026 03:30" ou "03:30").
 
 Formato (1 linha por evento):
 NOME | ACAO | QUANDO
 
 - ACAO: aceitou ou recusou
-- QUANDO: tempo visível (ou "sem_tempo")
 
 Se não houver eventos desse tipo, responda exatamente:
 SEM ALTERACOES`
@@ -231,7 +258,7 @@ SEM ALTERACOES`
       const name = (nameRaw || "").replace(/^@/g, "").trim();
       const action = (actionRaw || "").toLowerCase();
       const when = whenRaw || "sem_tempo";
-      return { name, action, when };
+      return { name, action, when, minuteKey: normalizeMinuteKey(whenRaw) };
     })
     .filter(e => e.name && (e.action === "aceitou" || e.action === "recusou"));
 }
@@ -249,7 +276,6 @@ async function usernameToUserId(username) {
 }
 
 async function resolveByDisplayName(displayName) {
-  // busca e tenta match por displayName
   const res = await api.get(
     `https://users.roblox.com/v1/users/search?keyword=${encodeURIComponent(displayName)}&limit=10`
   );
@@ -263,12 +289,10 @@ async function resolveByDisplayName(displayName) {
   const pick = exact || list[0];
   if (!pick?.id) return null;
 
-  // aqui dá pra pegar username real
   return { userId: pick.id, username: pick.name || null };
 }
 
 async function resolveUser(nameFromOCR) {
-  // retorna { userId, usernameForReport }
   const n = String(nameFromOCR || "").trim();
 
   if (isLikelyUsername(n)) {
@@ -277,7 +301,6 @@ async function resolveUser(nameFromOCR) {
     return { userId, usernameForReport: n };
   }
 
-  // fallback: display name -> search -> pega username real
   const byDisp = await resolveByDisplayName(n);
   if (!byDisp?.userId) return null;
 
@@ -296,7 +319,6 @@ async function kickFromGroup(userId) {
     headers: { "x-csrf-token": csrfToken }
   });
 
-  // CSRF renew
   if (res.status() === 403) {
     await refreshCSRF();
     res = await api.delete(`https://groups.roblox.com/v1/groups/${GROUP_ID}/users/${userId}`, {
@@ -304,7 +326,6 @@ async function kickFromGroup(userId) {
     });
   }
 
-  // auth caiu
   if (res.status() === 401) {
     throw new Error(`HTTP 401 (User is not authenticated) — cookie expirou/foi invalidado.`);
   }
@@ -320,65 +341,82 @@ async function kickFromGroup(userId) {
 /* ================= DETECÇÃO ================= */
 function now() { return Date.now(); }
 
-function recordActor(actor) {
-  const t = now();
-  if (!actorTimes.has(actor)) actorTimes.set(actor, []);
-  actorTimes.get(actor).push(t);
-
-  const cutoff = t - VOLUME_WINDOW_MS;
-  actorTimes.set(actor, actorTimes.get(actor).filter(x => x >= cutoff));
+function canPunish(key) {
+  return (punishedUntil.get(key) || 0) <= now();
 }
 
-function shouldPunish(actor) {
+function markPunished(key) {
+  punishedUntil.set(key, now() + PUNISH_COOLDOWN_MS);
+}
+
+// conta por minuto (mesmo minuto => soma)
+function recordMinute(actorKey, minuteKey) {
+  if (!actorMinuteCounts.has(actorKey)) actorMinuteCounts.set(actorKey, new Map());
+  const m = actorMinuteCounts.get(actorKey);
+
+  const cur = (m.get(minuteKey) || 0) + 1;
+  m.set(minuteKey, cur);
+
+  // limpa minutos velhos (mantém só últimos ~5 minutos por segurança)
+  if (m.size > 8) {
+    // remove chaves mais antigas por ordem de inserção
+    const keys = [...m.keys()];
+    for (let i = 0; i < keys.length - 8; i++) m.delete(keys[i]);
+  }
+
+  return cur;
+}
+
+// (extra) volume em 5 min
+function recordVolume(actorKey) {
+  const t = now();
+  if (!actorTimes.has(actorKey)) actorTimes.set(actorKey, []);
+  actorTimes.get(actorKey).push(t);
+  const cutoff = t - VOLUME_WINDOW_MS;
+  actorTimes.set(actorKey, actorTimes.get(actorKey).filter(x => x >= cutoff));
+  return actorTimes.get(actorKey).length;
+}
+
+function shouldPunish(actorKey, minuteCount, volumeCount) {
   if (TEST_MODE) return true;
 
-  const t = now();
-  const arr = actorTimes.get(actor) || [];
-  const burst = arr.filter(x => x >= t - BURST_WINDOW_MS).length;
-  const vol = arr.length;
+  // ✅ regra pedida:
+  if (minuteCount >= SAME_MINUTE_THRESHOLD) return true;
 
-  return burst >= BURST_THRESHOLD || vol >= VOLUME_THRESHOLD;
-}
+  // extra anti-bypass (se quiser manter)
+  if (volumeCount >= VOLUME_THRESHOLD) return true;
 
-function canPunish(actor) {
-  return (punishedUntil.get(actor) || 0) <= now();
-}
-
-function markPunished(actor) {
-  punishedUntil.set(actor, now() + PUNISH_COOLDOWN_MS);
+  return false;
 }
 /* ========================================= */
 
 /* ================= PUNIÇÃO ================= */
-async function punishActor(nameFromOCR) {
-  if (!canPunish(nameFromOCR)) return;
+async function punishActor(actorKey) {
+  if (!canPunish(actorKey)) return;
 
-  // resolve primeiro
-  const resolved = await resolveUser(nameFromOCR);
+  const resolved = await resolveUser(actorKey);
   if (!resolved) {
-    console.error(`⚠️ Não consegui resolver usuário a partir de "${nameFromOCR}" (display/username).`);
-    // evita spam infinito nesse cara “não resolvido”
-    markPunished(nameFromOCR);
+    console.error(`⚠️ Não consegui resolver usuário a partir de "${actorKey}".`);
+    markPunished(actorKey);
     return;
   }
 
   const { userId, usernameForReport } = resolved;
 
-  // 1) tenta kick
+  // 1) kick
   try {
     await kickFromGroup(userId);
     console.log(`✅ Kick OK: ${usernameForReport} (id=${userId})`);
   } catch (e) {
     console.error(`⚠️ Falha no kick de ${usernameForReport} (id=${userId}):`, String(e?.message || e));
-    // evita loop infinito tentando de novo toda hora
-    markPunished(nameFromOCR);
+    markPunished(actorKey);
     return;
   }
 
-  // 2) marca punido MESMO se Discord falhar
-  markPunished(nameFromOCR);
+  // 2) cooldown
+  markPunished(actorKey);
 
-  // 3) tenta mandar relatório (se falhar, só loga)
+  // 3) relatório
   try {
     await sendDiscord(formatRelatorioExilio(usernameForReport));
     console.log(`📣 Relatório enviado no Discord: ${usernameForReport}`);
@@ -406,7 +444,7 @@ async function monitorar() {
     const events = await ocrAuditEvents();
     try { fs.unlinkSync("audit.png"); } catch {}
 
-    // baseline (primeira leitura)
+    // baseline
     if (!baselineReady) {
       lastEventKeys = new Set(events.map(e => `${e.name}|${e.action}|${e.when}`));
       baselineReady = true;
@@ -422,13 +460,21 @@ async function monitorar() {
 
     if (!newKeys.length) return;
 
-    for (const k of newKeys) {
-      const [name] = k.split("|").map(x => x.trim());
+    // processa eventos novos
+    for (const key of newKeys) {
+      const [name, action, when] = key.split("|").map(x => x.trim());
 
-      recordActor(name);
+      const actorKey = name.replace(/^@/, "").trim();
+      const minuteKey = normalizeMinuteKey(when);
 
-      if (shouldPunish(name)) {
-        await punishActor(name);
+      const minuteCount = recordMinute(actorKey, minuteKey);
+      const volumeCount = recordVolume(actorKey);
+
+      // log debug útil
+      console.log(`📌 Evento: ${actorKey} ${action} | minuto="${minuteKey}" | countMin=${minuteCount} | vol5m=${volumeCount}`);
+
+      if (shouldPunish(actorKey, minuteCount, volumeCount)) {
+        await punishActor(actorKey);
       }
     }
   } catch (err) {
@@ -447,6 +493,7 @@ process.on("uncaughtException", (err) => console.error("UncaughtException:", err
   await initBrowser();
 
   console.log(`🛡️ Rodando | TEST_MODE=${TEST_MODE} | INTERVALO=${INTERVALO}ms`);
+  console.log(`✅ Regra: >=${SAME_MINUTE_THRESHOLD} ações no mesmo minuto (mesmo usuário) => exílio.`);
   console.log("ℹ️ Primeira captura = baseline (não pune ninguém).");
 
   await monitorar(); // seta baseline
