@@ -12,17 +12,22 @@ const OPENAI_KEY = process.env.OPENAI_API_KEY;
 
 const DISCORD_RESPONSAVEL_ID = "1455692969322614895";
 
+// teste: 5000 | produção: 300000 (5 min)
 const INTERVALO = Number(process.env.INTERVALO_MS || "5000");
+
+// TEST_MODE=1 => 1 evento já tenta exilar (pra teste)
 const TEST_MODE = String(process.env.TEST_MODE || "1") === "1";
 
+// regras (quando TEST_MODE=0)
 const BURST_WINDOW_MS = 10_000;
 const BURST_THRESHOLD = 3;
 
-const VOLUME_WINDOW_MS = 300_000;
+const VOLUME_WINDOW_MS = 300_000; // 5 min
 const VOLUME_THRESHOLD = 10;
 
 const PUNISH_COOLDOWN_MS = 30 * 60 * 1000;
 
+// audit log (mais estável que /audit-log em muitos casos)
 const AUDIT_URL = `https://www.roblox.com/groups/configure?id=${GROUP_ID}#!/auditLog`;
 /* ========================================= */
 
@@ -42,7 +47,7 @@ if (COOKIE.startsWith(".ROBLOSECURITY=")) {
 
 const openai = new OpenAI({ apiKey: OPENAI_KEY });
 
-// axios roblox (kick)
+/* ================= ROBLOX CLIENT (KICK) ================= */
 let csrfToken = null;
 const roblox = axios.create({
   headers: {
@@ -52,39 +57,6 @@ const roblox = axios.create({
   },
   validateStatus: () => true
 });
-
-// estado
-let running = false;
-let lastImgHash = "";
-let lastEventKeys = new Set();
-const actorTimes = new Map();
-const punishedUntil = new Map();
-
-// browser reuso
-let browser = null;
-let context = null;
-let page = null;
-
-/* ================= DISCORD ================= */
-async function sendDiscord(content) {
-  await axios.post(WEBHOOK, { content });
-}
-
-function formatRelatorioExilio(exilado) {
-  const data = new Date().toLocaleDateString("pt-BR");
-  return (
-`***Relatório de Exílio!
-
-Responsável: <@${DISCORD_RESPONSAVEL_ID}>
-
-Exilado(a): ${exilado}
-
-Motivo: Aceppt-all
-
-Data: ${data}***`
-  );
-}
-/* ========================================= */
 
 async function refreshCSRF() {
   const res = await roblox.post("https://auth.roblox.com/v2/logout");
@@ -118,24 +90,26 @@ async function searchNameToUserId(name) {
   );
   const data = res?.data?.data || [];
   const lower = String(name).toLowerCase();
+
   const exact = data.find(u =>
     String(u?.name || "").toLowerCase() === lower ||
     String(u?.displayName || "").toLowerCase() === lower
   );
   if (exact?.id) return exact.id;
+
   return data?.[0]?.id ?? null;
 }
 
 async function resolveUserId(actorText) {
   return (await usernameToUserId(actorText)) || (await searchNameToUserId(actorText));
 }
-/* ========================================================= */
 
 async function kickFromGroup(userId) {
   if (!csrfToken) await refreshCSRF();
 
   let res = await roblox.delete(`https://groups.roblox.com/v1/groups/${GROUP_ID}/users/${userId}`);
 
+  // tenta renovar token e repetir uma vez
   if (res.status === 403 || res.status === 400) {
     await refreshCSRF();
     res = await roblox.delete(`https://groups.roblox.com/v1/groups/${GROUP_ID}/users/${userId}`);
@@ -143,11 +117,45 @@ async function kickFromGroup(userId) {
 
   if (res.status < 200 || res.status >= 300) {
     const body = typeof res.data === "string" ? res.data : JSON.stringify(res.data);
-    throw new Error(`Falha ao exilar (HTTP ${res.status}) ${body?.slice(0, 180) || ""}`);
+    throw new Error(`Falha ao exilar (HTTP ${res.status}) ${body?.slice(0, 200) || ""}`);
   }
 }
+/* ========================================= */
+
+/* ================= DISCORD (SÓ RELATÓRIO) ================= */
+async function sendDiscord(content) {
+  await axios.post(WEBHOOK, { content });
+}
+
+function formatRelatorioExilio(exilado) {
+  const data = new Date().toLocaleDateString("pt-BR");
+  return (
+`***Relatório de Exílio!
+
+Responsável: <@${DISCORD_RESPONSAVEL_ID}>
+
+Exilado(a): ${exilado}
+
+Motivo: Aceppt-all
+
+Data: ${data}***`
+  );
+}
+/* ========================================= */
+
+/* ================= STATE ================= */
+let running = false;
+let lastImgHash = "";
+let lastEventKeys = new Set();        // dedupe OCR keys
+const actorTimes = new Map();         // actor -> timestamps
+const punishedUntil = new Map();      // actor -> cooldownUntil
+/* ========================================= */
 
 /* ================= PLAYWRIGHT ================= */
+let browser = null;
+let context = null;
+let page = null;
+
 async function closeSilently() {
   try { if (page && !page.isClosed()) await page.close(); } catch {}
   try { if (context) await context.close(); } catch {}
@@ -180,7 +188,10 @@ async function initBrowser() {
     const r = await fetch("https://users.roblox.com/v1/users/authenticated", { credentials: "include" });
     return r.status;
   });
-  if (status !== 200) throw new Error("Cookie não logou no navegador (inválido/expirado).");
+
+  if (status !== 200) {
+    throw new Error("Cookie não logou no navegador (inválido/expirado/sem permissão).");
+  }
 
   await page.goto(AUDIT_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
   await page.waitForTimeout(1200);
@@ -225,7 +236,7 @@ Retorne UMA linha por evento no formato:
 ATOR | ACAO | QUANDO
 
 - ACAO: aceitou ou recusou
-- QUANDO: o texto de tempo visível (ou "sem_tempo")
+- QUANDO: texto de tempo visível (ou "sem_tempo")
 
 Se não houver, responda: SEM ALTERACOES`
         },
@@ -258,16 +269,20 @@ function recordActor(actor) {
   if (!actorTimes.has(actor)) actorTimes.set(actor, []);
   actorTimes.get(actor).push(t);
 
+  // limpa > 5min
   const cutoff = t - VOLUME_WINDOW_MS;
   actorTimes.set(actor, actorTimes.get(actor).filter(x => x >= cutoff));
 }
 
 function shouldPunish(actor) {
   if (TEST_MODE) return true;
+
   const t = now();
   const arr = actorTimes.get(actor) || [];
+
   const burst = arr.filter(x => x >= t - BURST_WINDOW_MS).length;
   const vol = arr.length;
+
   return burst >= BURST_THRESHOLD || vol >= VOLUME_THRESHOLD;
 }
 
@@ -280,25 +295,28 @@ function markPunished(actor) {
 }
 /* ========================================= */
 
+/* ================= PUNIÇÃO ================= */
 async function punishActor(actor) {
   if (!canPunish(actor)) return;
 
-  await sendDiscord(formatRelatorioExilio(actor));
-
   try {
     const userId = await resolveUserId(actor);
-    if (!userId) throw new Error("Não consegui resolver userId.");
+    if (!userId) throw new Error("Não consegui resolver userId (username/displayName).");
+
     await kickFromGroup(userId);
+
+    // ✅ Só manda relatório se realmente exilou
+    await sendDiscord(formatRelatorioExilio(actor));
+
+    markPunished(actor);
   } catch (e) {
-    await sendDiscord(
-      `⚠️ Exílio automático falhou para **${actor}**.\n` +
-      `Erro: ${String(e?.message || e).slice(0, 500)}`
-    );
+    // ❌ erro somente no console
+    console.error(`⚠️ Falha ao punir/exilar ${actor}:`, String(e?.message || e));
   }
-
-  markPunished(actor);
 }
+/* ========================================= */
 
+/* ================= LOOP ================= */
 async function monitorar() {
   if (running) return;
   running = true;
@@ -314,10 +332,12 @@ async function monitorar() {
     lastImgHash = h;
 
     const events = await ocrAuditEvents();
+
     try { fs.unlinkSync("audit.png"); } catch {}
 
     if (!events.length) return;
 
+    // dedupe por "actor|action|when"
     const currentKeys = new Set(events.map(e => `${e.actor}|${e.action}|${e.when}`));
     const newKeys = [...currentKeys].filter(k => !lastEventKeys.has(k));
     lastEventKeys = currentKeys;
@@ -326,21 +346,34 @@ async function monitorar() {
 
     for (const k of newKeys) {
       const [actor] = k.split("|").map(x => x.trim());
+
       recordActor(actor);
-      if (shouldPunish(actor)) await punishActor(actor);
+
+      if (shouldPunish(actor)) {
+        await punishActor(actor);
+      }
     }
   } catch (err) {
-    console.error("Erro no monitor:", err?.message || err);
+    console.error("Erro no monitor:", String(err?.message || err));
     try { await closeSilently(); } catch {}
   } finally {
     running = false;
   }
 }
 
+process.on("unhandledRejection", (reason) => {
+  console.error("UnhandledRejection:", reason);
+});
+
+process.on("uncaughtException", (err) => {
+  console.error("UncaughtException:", err);
+});
+
+/* ================= START ================= */
 (async () => {
   const me = await validarCookieHTTP();
   if (!me) {
-    await sendDiscord("❌ ROBLOSECURITY inválido/expirado. Atualize o cookie.");
+    console.error("❌ ROBLOSECURITY inválido/expirado. Corrija e redeploy.");
     process.exit(1);
   }
 
