@@ -6,8 +6,6 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
 COPY package.json package-lock.json* ./
 RUN npm install
-
-# baixa browsers dentro da imagem
 RUN npx playwright install --with-deps firefox
 
 COPY . .
