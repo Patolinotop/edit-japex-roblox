@@ -34,7 +34,7 @@ const PUNISH_COOLDOWN_MS = 30 * 60 * 1000;
 const AUDIT_URL = `https://www.roblox.com/groups/configure?id=${GROUP_ID}#!/auditLog`;
 
 // Modelo de visão
-const VISION_MODEL = process.env.VISION_MODEL || "gpt-4.1";
+const VISION_MODEL = process.env.VISION_MODEL || "gpt-4o";
 
 // Robustez
 const CAPTURE_RETRIES = Number(process.env.CAPTURE_RETRIES || "3");
