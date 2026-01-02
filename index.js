@@ -50,7 +50,7 @@ const OPENAI_MAX_RETRIES = Number(process.env.OPENAI_MAX_RETRIES || "0");
 // IPv4 opcional
 const FORCE_IPV4 = String(process.env.FORCE_IPV4 || "0") === "1";
 
-// ✅ nomes exatos (do jeito da print) — pode mudar via env se quiser
+// ✅ nomes exatos (como na print)
 const CABO_ROLE_NAME = String(process.env.CABO_ROLE_NAME || "[Cb] Cabo");
 const THIRD_SGT_ROLE_NAME = String(process.env.THIRD_SGT_ROLE_NAME || "[3ºSgt] Terceiro Sargento");
 /* ========================================= */
@@ -246,7 +246,9 @@ let running = false;
 let baselineReady = false;
 
 let lastImgHash = "";
-let lastEventKeys = new Set();
+
+// ✅ agora é MULTISET: key -> count
+let lastEventCounts = new Map();
 
 const punishedUntil = new Map();     // actorKey -> cooldownUntil
 const actorMinuteCounts = new Map(); // actorKey -> Map(minuteKey -> count)
@@ -429,7 +431,7 @@ Filtrar SOMENTE descrições que contenham:
 - "aceitou o pedido de entrada"
 - "recusou o pedido de entrada"
 
-FORMATO DE SAÍDA (uma linha por evento):
+FORMATO DE SAÍDA (uma linha por evento, NÃO agrupe):
 ATOR | ACAO | QUANDO
 
 - ATOR: do campo "Usuário" (sem @)
@@ -533,7 +535,7 @@ async function getGroupRolesCached() {
 
   const body = await res.json();
   const roles = body?.roles || [];
-  // normaliza formato: { id, name, rank }
+
   const cleaned = roles
     .map(r => ({ id: r.id, name: r.name, rank: r.rank }))
     .filter(r => typeof r.id === "number" && typeof r.rank === "number");
@@ -542,7 +544,6 @@ async function getGroupRolesCached() {
 
   rolesCache = cleaned;
   rolesCacheAt = t;
-
   return rolesCache;
 }
 
@@ -551,13 +552,7 @@ function findRoleByExactName(roles, exactName) {
   return roles.find(r => norm(r.name) === target) || null;
 }
 
-function findRoleByIncludes(roles, needle) {
-  const n = norm(needle);
-  return roles.find(r => norm(r.name).includes(n)) || null;
-}
-
 async function getUserRoleInGroup(userId) {
-  // retorna roleName, roleRank, roleId do usuário nesse grupo
   const res = await api.get(`https://groups.roblox.com/v2/users/${userId}/groups/roles`);
   if (!res.ok()) return null;
   const body = await res.json();
@@ -627,6 +622,32 @@ async function kickFromGroup(userId) {
 }
 /* ========================================= */
 
+/* ================= MULTISET DIFF (NOVO) ================= */
+function makeEventKey(e) {
+  return `${e.name}|${e.action}|${e.when}`;
+}
+
+function buildCounts(events) {
+  const m = new Map();
+  for (const e of events) {
+    const k = makeEventKey(e);
+    m.set(k, (m.get(k) || 0) + 1);
+  }
+  return m;
+}
+
+// retorna lista de { key, times } onde times = ocorrências novas
+function diffCounts(prev, cur) {
+  const out = [];
+  for (const [k, curN] of cur.entries()) {
+    const prevN = prev.get(k) || 0;
+    const delta = curN - prevN;
+    if (delta > 0) out.push({ key: k, times: delta });
+  }
+  return out;
+}
+/* ========================================= */
+
 /* ================= DETECÇÃO ================= */
 function now() { return Date.now(); }
 
@@ -672,7 +693,6 @@ async function punishActor(actorKey) {
 
   const { userId, usernameForReport } = resolved;
 
-  // pega role atual do usuário no grupo
   const userRole = await getUserRoleInGroup(userId);
   if (!userRole) {
     console.error(`⚠️ Usuário ${usernameForReport} não está no grupo ou falha ao ler role.`);
@@ -682,25 +702,21 @@ async function punishActor(actorKey) {
 
   const roles = await getGroupRolesCached();
 
-  // achar ranks de referência
-  let cabo = findRoleByExactName(roles, CABO_ROLE_NAME) || findRoleByIncludes(roles, "cabo");
-  let third = findRoleByExactName(roles, THIRD_SGT_ROLE_NAME) || findRoleByIncludes(roles, "terceiro sargento");
+  const cabo = findRoleByExactName(roles, CABO_ROLE_NAME);
+  const third = findRoleByExactName(roles, THIRD_SGT_ROLE_NAME);
 
   if (!cabo || !third) {
     console.error("❌ Não achei roles de referência (Cabo / Terceiro Sargento).");
-    console.error("   Configure CABO_ROLE_NAME e THIRD_SGT_ROLE_NAME nas envs se necessário.");
+    console.error("   Verifique CABO_ROLE_NAME e THIRD_SGT_ROLE_NAME nas envs.");
     markPunished(actorKey);
     return;
   }
 
   const { roleName, roleRank } = userRole;
 
-  // regra:
-  // - se rank >= Terceiro Sargento => rebaixa 1 patente (mas nunca abaixo de Cabo)
-  // - se rank <= Cabo => exila
   try {
+    // third ou acima => rebaixa 1
     if (roleRank >= third.rank) {
-      // escolhe a role imediatamente abaixo por rank
       const below = roles.filter(r => r.rank < roleRank).sort((a, b) => b.rank - a.rank)[0] || null;
       if (!below) {
         console.error(`⚠️ Não achei role abaixo de ${roleName} para rebaixar.`);
@@ -708,7 +724,6 @@ async function punishActor(actorKey) {
         return;
       }
 
-      // nunca abaixo de cabo
       const targetRole = (below.rank < cabo.rank) ? cabo : below;
 
       if (!TEST_MODE) {
@@ -726,7 +741,7 @@ async function punishActor(actorKey) {
       return;
     }
 
-    // se não é third+ então é cabo ou abaixo => exila
+    // cabo ou abaixo => exila
     if (!TEST_MODE) {
       await kickFromGroup(userId);
     }
@@ -759,8 +774,9 @@ async function monitorar() {
 
     const events = await ocrAuditEvents();
 
+    // baseline (sem punir)
     if (!baselineReady) {
-      lastEventKeys = new Set(events.map(e => `${e.name}|${e.action}|${e.when}`));
+      lastEventCounts = buildCounts(events);
       baselineReady = true;
       console.log("✅ Baseline setado (OCR feito com sucesso).");
       return;
@@ -771,26 +787,32 @@ async function monitorar() {
       return;
     }
 
-    const currentKeys = new Set(events.map(e => `${e.name}|${e.action}|${e.when}`));
-    const newKeys = [...currentKeys].filter(k => !lastEventKeys.has(k));
-    lastEventKeys = currentKeys;
+    // ✅ agora conta ocorrências novas, inclusive repetidas no mesmo minuto
+    const currentCounts = buildCounts(events);
+    const news = diffCounts(lastEventCounts, currentCounts);
+    lastEventCounts = currentCounts;
 
-    if (!newKeys.length) {
+    if (!news.length) {
       console.log("ℹ️ Nenhum evento novo (diferença já vista).");
       return;
     }
 
-    for (const k of newKeys) {
-      const [name, action, when] = k.split("|").map(x => x.trim());
+    for (const item of news) {
+      const [name, action, when] = item.key.split("|").map(x => x.trim());
       const actorKey = name.replace(/^@/, "").trim();
       const minuteKey = normalizeMinuteKey(when);
 
-      const minuteCount = recordMinute(actorKey, minuteKey);
+      // processa "times" ocorrências novas
+      for (let i = 0; i < item.times; i++) {
+        const minuteCount = recordMinute(actorKey, minuteKey);
 
-      console.log(`📌 Evento pedido-entrada: ${actorKey} ${action} | minuto="${minuteKey}" | countMin=${minuteCount}`);
+        console.log(
+          `📌 Evento pedido-entrada: ${actorKey} ${action} | minuto="${minuteKey}" | countMin=${minuteCount} (occ ${i + 1}/${item.times})`
+        );
 
-      if (shouldPunish(minuteCount)) {
-        await punishActor(actorKey);
+        if (shouldPunish(minuteCount)) {
+          await punishActor(actorKey);
+        }
       }
     }
   } catch (err) {
@@ -811,14 +833,6 @@ process.on("uncaughtException", (err) => console.error("UncaughtException:", err
   console.log(`🛡️ Rodando | MODEL=${VISION_MODEL} | TEST_MODE=${TEST_MODE} | INTERVALO=${INTERVALO}ms`);
   console.log(`✅ Regra: >=${SAME_MINUTE_THRESHOLD} ações (aceitar/recusar pedido de entrada) no mesmo minuto => punição.`);
   console.log("ℹ️ Primeira execução faz baseline.");
-
-  // aquece cache de roles (não obrigatório, mas ajuda)
-  try {
-    await getGroupRolesCached();
-    console.log("✅ Roles do grupo cacheadas.");
-  } catch (e) {
-    console.error("⚠️ Não consegui cachear roles agora (vai tentar depois):", String(e?.message || e));
-  }
 
   await monitorar(); // baseline
   setInterval(monitorar, INTERVALO);
