@@ -297,19 +297,54 @@ async function authStatus() {
 }
 
 /**
- * ✅ IMPORTANTE:
- * Agora deixa o filtro em "Tudo" (não filtra por "Aceitar pedido...")
- * Assim aparece ACEITOU e RECUSOU no audit.
+ * ✅ Fecha qualquer dropdown/overlay que esteja aberto (principalmente o filtro).
+ * Faz ESC e depois um clique fora pra garantir.
  */
-async function ensureAuditFilterAll() {
+async function closeUiOverlays() {
+  try { await page.keyboard.press("Escape"); } catch {}
+  await page.waitForTimeout(120).catch(() => {});
+  try { await page.mouse.click(8, 8); } catch {}
+  await page.waitForTimeout(120).catch(() => {});
+}
+
+/**
+ * ✅ Garante que o filtro está em "Tudo" SEM deixar o menu aberto.
+ * Estratégia: localizar o input "Buscar usuários" e pegar o botão ao lado.
+ */
+async function ensureAuditFilterTudo() {
   try {
-    // tenta clicar em "Tudo" (quando o dropdown estiver em outro valor)
-    const tudo = page.getByText("Tudo", { exact: true }).first();
-    if (await tudo.count()) {
-      await tudo.click({ timeout: 1500 }).catch(() => {});
-      await page.waitForTimeout(250);
+    await closeUiOverlays();
+
+    const search = page.getByPlaceholder("Buscar usuários").first();
+    if (!(await search.count())) return;
+
+    const container = search.locator("..");
+    const dropdownBtn = container.locator("button").last();
+
+    const label = (await dropdownBtn.innerText().catch(() => "")).trim();
+
+    // Se já estiver em "Tudo", NÃO clica (porque clicar abre o menu)
+    if (norm(label).includes("tudo")) {
+      await closeUiOverlays();
+      return;
     }
-  } catch {}
+
+    // Se estiver diferente, abre e seleciona "Tudo"
+    await dropdownBtn.click({ timeout: 1500 }).catch(() => {});
+    await page.waitForTimeout(150);
+
+    // tenta clicar a opção "Tudo" no menu
+    const optTudoByText = page.getByText("Tudo", { exact: true }).first();
+    if (await optTudoByText.count()) {
+      await optTudoByText.click({ timeout: 1500 }).catch(() => {});
+    }
+
+    await page.waitForTimeout(150);
+    await closeUiOverlays(); // ✅ garante menu fechado
+  } catch {
+    // melhor esforço
+    try { await closeUiOverlays(); } catch {}
+  }
 }
 
 async function initBrowser() {
@@ -359,7 +394,7 @@ async function initBrowser() {
   await page.goto(AUDIT_URL, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS });
   await page.waitForTimeout(SHORT_WAIT_MS);
 
-  await ensureAuditFilterAll();
+  await ensureAuditFilterTudo();
 }
 
 // captura robusta
@@ -377,8 +412,12 @@ async function capturarAuditRobusto() {
       }
 
       await page.waitForTimeout(SHORT_WAIT_MS);
-      await ensureAuditFilterAll();
-      await page.waitForTimeout(450);
+
+      // ✅ garante filtro em Tudo e fecha menu antes de print
+      await ensureAuditFilterTudo();
+      await closeUiOverlays();
+
+      await page.waitForTimeout(250);
 
       await page.screenshot({ path: "audit_new.png" });
       rotateScreenshots();
@@ -801,7 +840,6 @@ async function monitorar() {
       const actorKey = name.replace(/^@/, "").trim();
       const minuteKey = normalizeMinuteKey(when);
 
-      // processa "times" ocorrências novas
       for (let i = 0; i < item.times; i++) {
         const minuteCount = recordMinute(actorKey, minuteKey);
 
