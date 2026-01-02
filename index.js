@@ -10,8 +10,11 @@ import dns from "dns";
 /* ================= CONFIG ================= */
 const GROUP_ID = process.env.GROUP_ID;
 let COOKIE = process.env.ROBLOSECURITY;
-const WEBHOOK = process.env.DISCORD_WEBHOOK;
-const OPENAI_KEY = process.env.OPENAI_API_KEY;
+
+const WEBHOOK_EXILIO = process.env.DISCORD_WEBHOOK_EXILIO;
+const WEBHOOK_REBAIXO = process.env.DISCORD_WEBHOOK_REBAIXAMENTO;
+
+let OPENAI_KEY = process.env.OPENAI_API_KEY;
 
 const DISCORD_RESPONSAVEL_ID = "1455692969322614895";
 
@@ -21,7 +24,7 @@ const INTERVALO = Number(process.env.INTERVALO_MS || "300000");
 // Test mode (padrão OFF)
 const TEST_MODE = String(process.env.TEST_MODE || "0") === "1";
 
-// Regra: 3+ ações no mesmo minuto pelo mesmo usuário => exílio
+// Regra: 3+ ações no mesmo minuto pelo mesmo usuário => punição
 const SAME_MINUTE_THRESHOLD = Number(process.env.SAME_MINUTE_THRESHOLD || "3");
 
 // Cooldown pra não punir em loop
@@ -30,7 +33,7 @@ const PUNISH_COOLDOWN_MS = 30 * 60 * 1000;
 // URL audit
 const AUDIT_URL = `https://www.roblox.com/groups/configure?id=${GROUP_ID}#!/auditLog`;
 
-// Modelo de visão (recomendado)
+// Modelo de visão
 const VISION_MODEL = process.env.VISION_MODEL || "gpt-4.1";
 
 // Robustez
@@ -40,15 +43,16 @@ const RETRY_DELAY_MS = Number(process.env.RETRY_DELAY_MS || "2500");
 const NAV_TIMEOUT_MS = Number(process.env.NAV_TIMEOUT_MS || "60000");
 const SHORT_WAIT_MS = Number(process.env.SHORT_WAIT_MS || "1200");
 
-// OCR timeout (OpenAI)
+// OpenAI timeouts
 const OCR_TIMEOUT_MS = Number(process.env.OCR_TIMEOUT_MS || "60000");
-
-// OpenAI SDK retries (deixa 0 pra não dobrar com teu loop de OCR)
 const OPENAI_MAX_RETRIES = Number(process.env.OPENAI_MAX_RETRIES || "0");
 
-// Opcional: força IPv4 (ajuda em hosts com IPv6 bugado)
-// setar: FORCE_IPV4=1
+// IPv4 opcional
 const FORCE_IPV4 = String(process.env.FORCE_IPV4 || "0") === "1";
+
+// ✅ nomes exatos (do jeito da print) — pode mudar via env se quiser
+const CABO_ROLE_NAME = String(process.env.CABO_ROLE_NAME || "[Cb] Cabo");
+const THIRD_SGT_ROLE_NAME = String(process.env.THIRD_SGT_ROLE_NAME || "[3ºSgt] Terceiro Sargento");
 /* ========================================= */
 
 if (FORCE_IPV4) {
@@ -58,25 +62,59 @@ if (FORCE_IPV4) {
   } catch {}
 }
 
-if (!GROUP_ID || !COOKIE || !WEBHOOK || !OPENAI_KEY) {
-  console.error("❌ Faltando env: GROUP_ID / ROBLOSECURITY / DISCORD_WEBHOOK / OPENAI_API_KEY");
-  process.exit(1);
+/* ================= SANITIZERS ================= */
+function stripOuterQuotes(s) {
+  const t = String(s || "").trim();
+  if ((t.startsWith('"') && t.endsWith('"')) || (t.startsWith("'") && t.endsWith("'"))) {
+    return t.slice(1, -1).trim();
+  }
+  return t;
 }
 
-// sanitiza cookie
-COOKIE = COOKIE.trim();
-if ((COOKIE.startsWith('"') && COOKIE.endsWith('"')) || (COOKIE.startsWith("'") && COOKIE.endsWith("'"))) {
-  COOKIE = COOKIE.slice(1, -1).trim();
+function sanitizeApiKey(key) {
+  let k = stripOuterQuotes(key);
+  k = k.replace(/^Bearer\s+/i, "");
+  k = k.replace(/[\r\n\t]/g, "");
+  k = k.replace(/\s+/g, "").trim();
+  return k;
 }
+
+function redactSecrets(s) {
+  const str = String(s || "");
+  return str.replace(/sk-(proj-)?[A-Za-z0-9_\-]{10,}/g, "sk-***REDACTED***");
+}
+
+function norm(s) {
+  return String(s || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .trim();
+}
+/* ============================================ */
+
+OPENAI_KEY = sanitizeApiKey(OPENAI_KEY);
+COOKIE = stripOuterQuotes(String(COOKIE || "").trim());
+
 if (COOKIE.startsWith(".ROBLOSECURITY=")) {
   COOKIE = COOKIE.replace(".ROBLOSECURITY=", "").trim();
 }
 
-// ✅ OpenAI client: timeout e retries no lugar certo
+if (!GROUP_ID || !COOKIE || !OPENAI_KEY || !WEBHOOK_EXILIO || !WEBHOOK_REBAIXO) {
+  console.error("❌ Faltando env:");
+  console.error("  - GROUP_ID");
+  console.error("  - ROBLOSECURITY");
+  console.error("  - OPENAI_API_KEY");
+  console.error("  - DISCORD_WEBHOOK_EXILIO");
+  console.error("  - DISCORD_WEBHOOK_REBAIXAMENTO");
+  process.exit(1);
+}
+
+// OpenAI client
 const openai = new OpenAI({
   apiKey: OPENAI_KEY,
-  timeout: OCR_TIMEOUT_MS,      // default p/ todas as requests (pode sobrescrever por request)
-  maxRetries: OPENAI_MAX_RETRIES // 0 recomendado aqui pq vc já faz retries manuais no OCR
+  timeout: OCR_TIMEOUT_MS,
+  maxRetries: OPENAI_MAX_RETRIES
 });
 
 /* ================= HELPERS ================= */
@@ -88,7 +126,6 @@ function sha256File(filepath) {
 }
 
 function rotateScreenshots() {
-  // mantém só 2 arquivos: prev e last
   try {
     if (fs.existsSync("audit_last.png")) {
       try { fs.unlinkSync("audit_prev.png"); } catch {}
@@ -113,42 +150,40 @@ function isLikelyUsername(s) {
 
 function formatOpenAIError(err) {
   try {
-    // SDK oficial: erros são subclasses de APIError (inclui APIConnectionError). :contentReference[oaicite:1]{index=1}
     const isApiErr = err instanceof OpenAI.APIError;
     const base = {
       name: err?.name,
-      message: err?.message,
+      message: redactSecrets(err?.message),
       status: isApiErr ? err.status : undefined,
       code: isApiErr ? err.code : undefined,
       request_id: isApiErr ? err.request_id : undefined
     };
-
-    // causas comuns em connection error
     const cause = err?.cause;
     if (cause) {
       base.cause = {
         name: cause?.name,
-        message: cause?.message,
+        message: redactSecrets(cause?.message),
         code: cause?.code,
         errno: cause?.errno,
-        syscall: cause?.syscall,
-        address: cause?.address,
-        port: cause?.port
+        syscall: cause?.syscall
       };
     }
-
     return JSON.stringify(base);
   } catch {
-    return String(err?.message || err);
+    return redactSecrets(String(err?.message || err));
   }
+}
+
+function hojeBR() {
+  return new Date().toLocaleDateString("pt-BR");
 }
 /* ========================================= */
 
 /* ================= DISCORD ================= */
-async function sendDiscord(content, imagePath = null) {
+async function sendDiscord(webhookUrl, content, imagePath = null) {
   try {
     if (!imagePath) {
-      await axios.post(WEBHOOK, { content });
+      await axios.post(webhookUrl, { content });
       return;
     }
 
@@ -156,12 +191,18 @@ async function sendDiscord(content, imagePath = null) {
     form.append("payload_json", JSON.stringify({ content }));
     form.append("file", fs.createReadStream(imagePath), { filename: "auditoria.png" });
 
-    const res = await axios.post(WEBHOOK, form, { headers: form.getHeaders(), validateStatus: () => true });
+    const res = await axios.post(webhookUrl, form, {
+      headers: form.getHeaders(),
+      validateStatus: () => true
+    });
 
     if (res.status === 429) {
       const retryAfter = Number(res.headers["retry-after"]) || 1;
       await sleep(retryAfter * 1000);
-      await axios.post(WEBHOOK, form, { headers: form.getHeaders(), validateStatus: () => true });
+      await axios.post(webhookUrl, form, {
+        headers: form.getHeaders(),
+        validateStatus: () => true
+      });
     }
   } catch (e) {
     console.error("⚠️ Discord falhou:", String(e?.message || e));
@@ -169,7 +210,7 @@ async function sendDiscord(content, imagePath = null) {
 }
 
 function formatRelatorioExilio(usernameSemArroba) {
-  const data = new Date().toLocaleDateString("pt-BR");
+  const data = hojeBR();
   return (
 `***Relatório de Exílio!
 
@@ -178,6 +219,22 @@ Responsável: <@${DISCORD_RESPONSAVEL_ID}>
 Exilado(a): ${usernameSemArroba}
 
 Motivo: Aceppt-all
+
+Data: ${data}***`
+  );
+}
+
+function formatRelatorioRebaixamento(usernameSemArroba, patenteAntiga, patenteNova) {
+  const data = hojeBR();
+  return (
+`***Relatório de Rebaixamento!
+
+Responsável: <@${DISCORD_RESPONSAVEL_ID}>
+
+Rebaixado(a): ${usernameSemArroba}
+
+Patente antiga: ${patenteAntiga}
+Patente nova: ${patenteNova}
 
 Data: ${data}***`
   );
@@ -193,6 +250,11 @@ let lastEventKeys = new Set();
 
 const punishedUntil = new Map();     // actorKey -> cooldownUntil
 const actorMinuteCounts = new Map(); // actorKey -> Map(minuteKey -> count)
+
+// cache de roles do grupo
+let rolesCache = null;
+let rolesCacheAt = 0;
+const ROLES_CACHE_MS = 10 * 60 * 1000;
 /* ========================================= */
 
 /* ================= PLAYWRIGHT SETUP ================= */
@@ -233,7 +295,6 @@ async function authStatus() {
 }
 
 async function ensureEntryRequestFilter() {
-  // Melhor esforço: se não achar, OCR já filtra por texto "pedido de entrada"
   try {
     const tudo = page.getByText("Tudo", { exact: true }).first();
     if (await tudo.count()) {
@@ -287,7 +348,7 @@ async function initBrowser() {
   await page.waitForTimeout(SHORT_WAIT_MS);
 
   const s = await authStatus();
-  if (s !== 200) throw new Error(`ROBLOSECURITY(all) inválido/expirado (status ${s}).`);
+  if (s !== 200) throw new Error(`ROBLOSECURITY inválido/expirado (status ${s}).`);
 
   await refreshCSRF();
 
@@ -298,7 +359,7 @@ async function initBrowser() {
   await ensureEntryRequestFilter();
 }
 
-// captura com retry + fallback reload->goto, e se falhar reinicia browser
+// captura robusta
 async function capturarAuditRobusto() {
   if (!page || page.isClosed()) await initBrowser();
 
@@ -333,7 +394,7 @@ async function capturarAuditRobusto() {
 }
 /* ========================================= */
 
-/* ================= OCR (RETRY + NÃO DERRUBA LOOP) ================= */
+/* ================= OCR ================= */
 async function ocrAuditEvents() {
   const base64 = fs.readFileSync("audit_last.png").toString("base64");
 
@@ -344,46 +405,49 @@ async function ocrAuditEvents() {
       const resp = await openai.responses.create(
         {
           model: VISION_MODEL,
-          max_output_tokens: 220,
+          temperature: 0,
+          max_output_tokens: 500,
           input: [{
             role: "user",
             content: [
               {
                 type: "input_text",
                 text:
-`Você está vendo a página "Atividade do grupo" (audit log) do Roblox.
+`Você está vendo uma TABELA do Roblox "Atividade do grupo" com colunas: Data | Usuário | Descrição.
 
-Extraia SOMENTE eventos de PEDIDO DE ENTRADA:
+OBJETIVO:
+Extrair SOMENTE eventos de PEDIDO DE ENTRADA (aceitou/recusou), mas o NOME que importa é SEMPRE QUEM FEZ A AÇÃO (coluna "Usuário").
+
+REGRAS IMPORTANTES:
+1) O "Usuário" (coluna do meio) é o ATOR: quem aceitou/recusou.
+2) Na "Descrição" aparece "do usuário <ALVO>". Esse <ALVO> NUNCA é o ator. NÃO use esse nome.
+3) O ator deve vir da coluna "Usuário".
+   - Se existir um @handle abaixo do nome (ex: @camillygamer_01), use ELE (sem @).
+   - Se não existir, use o nome de exibição da coluna.
+
+Filtrar SOMENTE descrições que contenham:
 - "aceitou o pedido de entrada"
 - "recusou o pedido de entrada"
 
-IGNORE:
-- mudança de cargo
-- remover/ban/desban
-- qualquer outra ação
+FORMATO DE SAÍDA (uma linha por evento):
+ATOR | ACAO | QUANDO
 
-Só inclua se tiver explicitamente "pedido de entrada" na descrição.
+- ATOR: do campo "Usuário" (sem @)
+- ACAO: "aceitou" ou "recusou"
+- QUANDO: pegue o horário HH:MM visível em "Data"
 
-Formato:
-NOME | ACAO | QUANDO
-
-- NOME: use @username (sem "@") se visível; senão display name
-- ACAO: aceitou ou recusou
-- QUANDO: copie o tempo visível (ideal HH:MM)
-
-Se não houver, responda exatamente:
+Se não houver eventos, responda exatamente:
 SEM ALTERACOES`
               },
               { type: "input_image", image_url: `data:image/png;base64,${base64}` }
             ]
           }]
         },
-        // ✅ timeout correto: 2º argumento (override por request) :contentReference[oaicite:2]{index=2}
         { timeout: OCR_TIMEOUT_MS, maxRetries: 0 }
       );
 
       const text = (resp.output_text || "").trim();
-      console.log("✅ OCR retornou:", text ? text.slice(0, 120) : "(vazio)");
+      console.log("✅ OCR retornou:", text ? text.slice(0, 180) : "(vazio)");
 
       if (!text || text === "SEM ALTERACOES") return [];
 
@@ -402,8 +466,6 @@ SEM ALTERACOES`
         .filter(e => e.name && (e.action === "aceitou" || e.action === "recusou"));
     } catch (e) {
       console.error(`⚠️ OCR falhou (tentativa ${attempt}):`, formatOpenAIError(e));
-
-      // backoff simples (pra evitar bater em rede instável)
       const backoff = Math.min(1500 * attempt, 8000);
       await sleep(backoff);
     }
@@ -414,7 +476,7 @@ SEM ALTERACOES`
 }
 /* ========================================= */
 
-/* ================= RESOLVE USER ================= */
+/* ================= ROBLOX RESOLVE USER ================= */
 async function usernameToUserId(username) {
   const res = await api.post("https://users.roblox.com/v1/usernames/users", {
     data: { usernames: [username], excludeBannedUsers: false }
@@ -458,6 +520,85 @@ async function resolveUser(nameFromOCR) {
     userId: byDisp.userId,
     usernameForReport: (byDisp.username || n).replace(/^@/, "")
   };
+}
+/* ========================================= */
+
+/* ================= GROUP ROLES (para rebaixar) ================= */
+async function getGroupRolesCached() {
+  const t = Date.now();
+  if (rolesCache && (t - rolesCacheAt) < ROLES_CACHE_MS) return rolesCache;
+
+  const res = await api.get(`https://groups.roblox.com/v1/groups/${GROUP_ID}/roles`);
+  if (!res.ok()) throw new Error(`Falha roles group: HTTP ${res.status()}`);
+
+  const body = await res.json();
+  const roles = body?.roles || [];
+  // normaliza formato: { id, name, rank }
+  const cleaned = roles
+    .map(r => ({ id: r.id, name: r.name, rank: r.rank }))
+    .filter(r => typeof r.id === "number" && typeof r.rank === "number");
+
+  cleaned.sort((a, b) => a.rank - b.rank);
+
+  rolesCache = cleaned;
+  rolesCacheAt = t;
+
+  return rolesCache;
+}
+
+function findRoleByExactName(roles, exactName) {
+  const target = norm(exactName);
+  return roles.find(r => norm(r.name) === target) || null;
+}
+
+function findRoleByIncludes(roles, needle) {
+  const n = norm(needle);
+  return roles.find(r => norm(r.name).includes(n)) || null;
+}
+
+async function getUserRoleInGroup(userId) {
+  // retorna roleName, roleRank, roleId do usuário nesse grupo
+  const res = await api.get(`https://groups.roblox.com/v2/users/${userId}/groups/roles`);
+  if (!res.ok()) return null;
+  const body = await res.json();
+  const data = body?.data || [];
+
+  const entry = data.find(g => String(g?.group?.id) === String(GROUP_ID));
+  if (!entry) return null;
+
+  const role = entry?.role;
+  if (!role) return null;
+
+  return {
+    roleId: role.id,
+    roleName: role.name,
+    roleRank: role.rank
+  };
+}
+
+async function setUserRole(userId, newRoleId) {
+  if (!csrfToken) await refreshCSRF();
+
+  let res = await api.patch(`https://groups.roblox.com/v1/groups/${GROUP_ID}/users/${userId}`, {
+    headers: { "x-csrf-token": csrfToken },
+    data: { roleId: newRoleId }
+  });
+
+  if (res.status() === 403) {
+    await refreshCSRF();
+    res = await api.patch(`https://groups.roblox.com/v1/groups/${GROUP_ID}/users/${userId}`, {
+      headers: { "x-csrf-token": csrfToken },
+      data: { roleId: newRoleId }
+    });
+  }
+
+  if (res.status() === 401) throw new Error("HTTP 401 (cookie inválido/expirou).");
+
+  if (res.status() < 200 || res.status() >= 300) {
+    let body = "";
+    try { body = JSON.stringify(await res.json()).slice(0, 260); } catch {}
+    throw new Error(`PATCH role HTTP ${res.status()} ${body}`);
+  }
 }
 /* ========================================= */
 
@@ -518,7 +659,7 @@ function shouldPunish(minuteCount) {
 }
 /* ========================================= */
 
-/* ================= PUNIÇÃO ================= */
+/* ================= PUNIÇÃO (REBAIXA OU EXILA) ================= */
 async function punishActor(actorKey) {
   if (!canPunish(actorKey)) return;
 
@@ -531,17 +672,73 @@ async function punishActor(actorKey) {
 
   const { userId, usernameForReport } = resolved;
 
-  try {
-    await kickFromGroup(userId);
-    console.log(`✅ Kick OK: ${usernameForReport} (id=${userId})`);
-  } catch (e) {
-    console.error(`⚠️ Falha no kick de ${usernameForReport} (id=${userId}):`, String(e?.message || e));
+  // pega role atual do usuário no grupo
+  const userRole = await getUserRoleInGroup(userId);
+  if (!userRole) {
+    console.error(`⚠️ Usuário ${usernameForReport} não está no grupo ou falha ao ler role.`);
     markPunished(actorKey);
     return;
   }
 
-  markPunished(actorKey);
-  await sendDiscord(formatRelatorioExilio(usernameForReport), "audit_last.png");
+  const roles = await getGroupRolesCached();
+
+  // achar ranks de referência
+  let cabo = findRoleByExactName(roles, CABO_ROLE_NAME) || findRoleByIncludes(roles, "cabo");
+  let third = findRoleByExactName(roles, THIRD_SGT_ROLE_NAME) || findRoleByIncludes(roles, "terceiro sargento");
+
+  if (!cabo || !third) {
+    console.error("❌ Não achei roles de referência (Cabo / Terceiro Sargento).");
+    console.error("   Configure CABO_ROLE_NAME e THIRD_SGT_ROLE_NAME nas envs se necessário.");
+    markPunished(actorKey);
+    return;
+  }
+
+  const { roleName, roleRank } = userRole;
+
+  // regra:
+  // - se rank >= Terceiro Sargento => rebaixa 1 patente (mas nunca abaixo de Cabo)
+  // - se rank <= Cabo => exila
+  try {
+    if (roleRank >= third.rank) {
+      // escolhe a role imediatamente abaixo por rank
+      const below = roles.filter(r => r.rank < roleRank).sort((a, b) => b.rank - a.rank)[0] || null;
+      if (!below) {
+        console.error(`⚠️ Não achei role abaixo de ${roleName} para rebaixar.`);
+        markPunished(actorKey);
+        return;
+      }
+
+      // nunca abaixo de cabo
+      const targetRole = (below.rank < cabo.rank) ? cabo : below;
+
+      if (!TEST_MODE) {
+        await setUserRole(userId, targetRole.id);
+      }
+
+      console.log(`✅ Rebaixamento OK: ${usernameForReport} | ${roleName} -> ${targetRole.name}`);
+
+      markPunished(actorKey);
+      await sendDiscord(
+        WEBHOOK_REBAIXO,
+        formatRelatorioRebaixamento(usernameForReport, roleName, targetRole.name),
+        "audit_last.png"
+      );
+      return;
+    }
+
+    // se não é third+ então é cabo ou abaixo => exila
+    if (!TEST_MODE) {
+      await kickFromGroup(userId);
+    }
+
+    console.log(`✅ Exílio OK: ${usernameForReport} (rank=${roleRank}, role=${roleName})`);
+
+    markPunished(actorKey);
+    await sendDiscord(WEBHOOK_EXILIO, formatRelatorioExilio(usernameForReport), "audit_last.png");
+  } catch (e) {
+    console.error(`⚠️ Falha punição de ${usernameForReport}:`, String(e?.message || e));
+    markPunished(actorKey);
+  }
 }
 /* ========================================= */
 
@@ -598,8 +795,6 @@ async function monitorar() {
     }
   } catch (err) {
     console.error("Erro no monitor:", String(err?.message || err));
-    // ✅ NÃO fecha browser por erro de OCR (OCR já trata). Só fecha se monitor inteiro falhar.
-    // Reabrirá na próxima tentativa
     try { await closeSilently(); } catch {}
   } finally {
     running = false;
@@ -614,8 +809,16 @@ process.on("uncaughtException", (err) => console.error("UncaughtException:", err
   await initBrowser();
 
   console.log(`🛡️ Rodando | MODEL=${VISION_MODEL} | TEST_MODE=${TEST_MODE} | INTERVALO=${INTERVALO}ms`);
-  console.log(`✅ Regra: >=${SAME_MINUTE_THRESHOLD} ações (aceitar/recusar pedido de entrada) no mesmo minuto => exílio.`);
+  console.log(`✅ Regra: >=${SAME_MINUTE_THRESHOLD} ações (aceitar/recusar pedido de entrada) no mesmo minuto => punição.`);
   console.log("ℹ️ Primeira execução faz baseline.");
+
+  // aquece cache de roles (não obrigatório, mas ajuda)
+  try {
+    await getGroupRolesCached();
+    console.log("✅ Roles do grupo cacheadas.");
+  } catch (e) {
+    console.error("⚠️ Não consegui cachear roles agora (vai tentar depois):", String(e?.message || e));
+  }
 
   await monitorar(); // baseline
   setInterval(monitorar, INTERVALO);
