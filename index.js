@@ -247,7 +247,7 @@ let baselineReady = false;
 
 let lastImgHash = "";
 
-// ✅ agora é MULTISET: key -> count
+// ✅ MULTISET: key -> count
 let lastEventCounts = new Map();
 
 const punishedUntil = new Map();     // actorKey -> cooldownUntil
@@ -296,17 +296,18 @@ async function authStatus() {
   return res.status();
 }
 
-async function ensureEntryRequestFilter() {
+/**
+ * ✅ IMPORTANTE:
+ * Agora deixa o filtro em "Tudo" (não filtra por "Aceitar pedido...")
+ * Assim aparece ACEITOU e RECUSOU no audit.
+ */
+async function ensureAuditFilterAll() {
   try {
+    // tenta clicar em "Tudo" (quando o dropdown estiver em outro valor)
     const tudo = page.getByText("Tudo", { exact: true }).first();
     if (await tudo.count()) {
       await tudo.click({ timeout: 1500 }).catch(() => {});
       await page.waitForTimeout(250);
-    }
-    const opt = page.getByText("Aceitar pedido de entrada", { exact: false }).first();
-    if (await opt.count()) {
-      await opt.click({ timeout: 1500 }).catch(() => {});
-      await page.waitForTimeout(350);
     }
   } catch {}
 }
@@ -358,7 +359,7 @@ async function initBrowser() {
   await page.goto(AUDIT_URL, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS });
   await page.waitForTimeout(SHORT_WAIT_MS);
 
-  await ensureEntryRequestFilter();
+  await ensureAuditFilterAll();
 }
 
 // captura robusta
@@ -376,7 +377,7 @@ async function capturarAuditRobusto() {
       }
 
       await page.waitForTimeout(SHORT_WAIT_MS);
-      await ensureEntryRequestFilter();
+      await ensureAuditFilterAll();
       await page.waitForTimeout(450);
 
       await page.screenshot({ path: "audit_new.png" });
@@ -408,7 +409,7 @@ async function ocrAuditEvents() {
         {
           model: VISION_MODEL,
           temperature: 0,
-          max_output_tokens: 500,
+          max_output_tokens: 650,
           input: [{
             role: "user",
             content: [
@@ -431,7 +432,7 @@ Filtrar SOMENTE descrições que contenham:
 - "aceitou o pedido de entrada"
 - "recusou o pedido de entrada"
 
-FORMATO DE SAÍDA (uma linha por evento, NÃO agrupe):
+FORMATO DE SAÍDA (uma linha por evento, NÃO agrupe e NÃO remova repetidos):
 ATOR | ACAO | QUANDO
 
 - ATOR: do campo "Usuário" (sem @)
@@ -622,7 +623,7 @@ async function kickFromGroup(userId) {
 }
 /* ========================================= */
 
-/* ================= MULTISET DIFF (NOVO) ================= */
+/* ================= MULTISET DIFF ================= */
 function makeEventKey(e) {
   return `${e.name}|${e.action}|${e.when}`;
 }
@@ -636,7 +637,6 @@ function buildCounts(events) {
   return m;
 }
 
-// retorna lista de { key, times } onde times = ocorrências novas
 function diffCounts(prev, cur) {
   const out = [];
   for (const [k, curN] of cur.entries()) {
@@ -787,7 +787,6 @@ async function monitorar() {
       return;
     }
 
-    // ✅ agora conta ocorrências novas, inclusive repetidas no mesmo minuto
     const currentCounts = buildCounts(events);
     const news = diffCounts(lastEventCounts, currentCounts);
     lastEventCounts = currentCounts;
