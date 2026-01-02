@@ -5,6 +5,7 @@ import fs from "fs";
 import crypto from "crypto";
 import FormData from "form-data";
 import { execSync } from "child_process";
+import dns from "dns";
 
 /* ================= CONFIG ================= */
 const GROUP_ID = process.env.GROUP_ID;
@@ -38,7 +39,24 @@ const OCR_RETRIES = Number(process.env.OCR_RETRIES || "3");
 const RETRY_DELAY_MS = Number(process.env.RETRY_DELAY_MS || "2500");
 const NAV_TIMEOUT_MS = Number(process.env.NAV_TIMEOUT_MS || "60000");
 const SHORT_WAIT_MS = Number(process.env.SHORT_WAIT_MS || "1200");
+
+// OCR timeout (OpenAI)
+const OCR_TIMEOUT_MS = Number(process.env.OCR_TIMEOUT_MS || "60000");
+
+// OpenAI SDK retries (deixa 0 pra não dobrar com teu loop de OCR)
+const OPENAI_MAX_RETRIES = Number(process.env.OPENAI_MAX_RETRIES || "0");
+
+// Opcional: força IPv4 (ajuda em hosts com IPv6 bugado)
+// setar: FORCE_IPV4=1
+const FORCE_IPV4 = String(process.env.FORCE_IPV4 || "0") === "1";
 /* ========================================= */
+
+if (FORCE_IPV4) {
+  try {
+    dns.setDefaultResultOrder("ipv4first");
+    console.log("🌐 FORCE_IPV4=1 => DNS ipv4first habilitado.");
+  } catch {}
+}
 
 if (!GROUP_ID || !COOKIE || !WEBHOOK || !OPENAI_KEY) {
   console.error("❌ Faltando env: GROUP_ID / ROBLOSECURITY / DISCORD_WEBHOOK / OPENAI_API_KEY");
@@ -54,7 +72,12 @@ if (COOKIE.startsWith(".ROBLOSECURITY=")) {
   COOKIE = COOKIE.replace(".ROBLOSECURITY=", "").trim();
 }
 
-const openai = new OpenAI({ apiKey: OPENAI_KEY });
+// ✅ OpenAI client: timeout e retries no lugar certo
+const openai = new OpenAI({
+  apiKey: OPENAI_KEY,
+  timeout: OCR_TIMEOUT_MS,      // default p/ todas as requests (pode sobrescrever por request)
+  maxRetries: OPENAI_MAX_RETRIES // 0 recomendado aqui pq vc já faz retries manuais no OCR
+});
 
 /* ================= HELPERS ================= */
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -86,6 +109,38 @@ function normalizeMinuteKey(whenRaw) {
 function isLikelyUsername(s) {
   const t = String(s || "").trim().replace(/^@/, "");
   return /^[a-zA-Z0-9_]{3,20}$/.test(t);
+}
+
+function formatOpenAIError(err) {
+  try {
+    // SDK oficial: erros são subclasses de APIError (inclui APIConnectionError). :contentReference[oaicite:1]{index=1}
+    const isApiErr = err instanceof OpenAI.APIError;
+    const base = {
+      name: err?.name,
+      message: err?.message,
+      status: isApiErr ? err.status : undefined,
+      code: isApiErr ? err.code : undefined,
+      request_id: isApiErr ? err.request_id : undefined
+    };
+
+    // causas comuns em connection error
+    const cause = err?.cause;
+    if (cause) {
+      base.cause = {
+        name: cause?.name,
+        message: cause?.message,
+        code: cause?.code,
+        errno: cause?.errno,
+        syscall: cause?.syscall,
+        address: cause?.address,
+        port: cause?.port
+      };
+    }
+
+    return JSON.stringify(base);
+  } catch {
+    return String(err?.message || err);
+  }
 }
 /* ========================================= */
 
@@ -286,16 +341,16 @@ async function ocrAuditEvents() {
     try {
       console.log(`🧠 OCR tentativa ${attempt}/${OCR_RETRIES}...`);
 
-      const resp = await openai.responses.create({
-        model: VISION_MODEL,
-        max_output_tokens: 220,
-        timeout: 60_000,
-        input: [{
-          role: "user",
-          content: [
-            {
-              type: "input_text",
-              text:
+      const resp = await openai.responses.create(
+        {
+          model: VISION_MODEL,
+          max_output_tokens: 220,
+          input: [{
+            role: "user",
+            content: [
+              {
+                type: "input_text",
+                text:
 `Você está vendo a página "Atividade do grupo" (audit log) do Roblox.
 
 Extraia SOMENTE eventos de PEDIDO DE ENTRADA:
@@ -318,11 +373,14 @@ NOME | ACAO | QUANDO
 
 Se não houver, responda exatamente:
 SEM ALTERACOES`
-            },
-            { type: "input_image", image_url: `data:image/png;base64,${base64}` }
-          ]
-        }]
-      });
+              },
+              { type: "input_image", image_url: `data:image/png;base64,${base64}` }
+            ]
+          }]
+        },
+        // ✅ timeout correto: 2º argumento (override por request) :contentReference[oaicite:2]{index=2}
+        { timeout: OCR_TIMEOUT_MS, maxRetries: 0 }
+      );
 
       const text = (resp.output_text || "").trim();
       console.log("✅ OCR retornou:", text ? text.slice(0, 120) : "(vazio)");
@@ -343,8 +401,11 @@ SEM ALTERACOES`
         })
         .filter(e => e.name && (e.action === "aceitou" || e.action === "recusou"));
     } catch (e) {
-      console.error(`⚠️ OCR falhou (tentativa ${attempt}):`, String(e?.message || e));
-      await sleep(3000);
+      console.error(`⚠️ OCR falhou (tentativa ${attempt}):`, formatOpenAIError(e));
+
+      // backoff simples (pra evitar bater em rede instável)
+      const backoff = Math.min(1500 * attempt, 8000);
+      await sleep(backoff);
     }
   }
 
